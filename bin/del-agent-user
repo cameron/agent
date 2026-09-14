@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+USER_NAME=agent
+
+if ! id "$USER_NAME" &>/dev/null; then
+  echo "user '$USER_NAME' does not exist; nothing to do"
+  exit 0
+fi
+
+pkill -KILL -u "$USER_NAME" 2>/dev/null || true
+sleep 1
+
+rm -f "/home/$USER_NAME/.claude"
+
+setfacl -R -x "u:$USER_NAME" /root 2>/dev/null || true
+setfacl -R -d -x "u:$USER_NAME" /root 2>/dev/null || true
+
+userdel -r "$USER_NAME"
+
+echo "removed user '$USER_NAME', its home dir, and its ACL entries on /root"

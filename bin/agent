@@ -1,0 +1,1714 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+# Harnesses use Bash command syntax, including when the account login shell is fish.
+export SHELL="$BASH"
+
+agent_bin="${AGENT_BIN:-codex}"
+default_codex_sandbox="${AGENT_CODEX_SANDBOX:-${AGENT_EXEC_SANDBOX:-danger-full-access}}"
+default_codex_approval="${AGENT_CODEX_APPROVAL:-never}"
+env_path="${AGENT_ENV_PATH:-/etc/env/path}"
+launch_dir="$(pwd -P)"
+agent_path="${AGENTSPATH:-/etc/agent:~/.agent:\$gitroot:.}"
+agent_template_bin="${AGENT_TEMPLATE_BIN:-agent.template}"
+agent_original_argv=("$@")
+agent_program_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+agent_share_dir="${AGENT_SHARE_DIR:-$agent_program_dir/../share/agent}"
+agent_transcripts_dir="${AGENT_TRANSCRIPTS_DIR:-$agent_program_dir/../agent-transcripts}"
+agent_transcripts_bin="${AGENT_TRANSCRIPTS_BIN:-$agent_transcripts_dir/agent_transcripts.py}"
+
+# Transcript commands do not launch a harness or collect prompt instructions.
+if [[ "${1:-}" == transcripts ]]; then
+  shift
+  export AGENT_TRANSCRIPTS_PROG='agent transcripts'
+  exec "$agent_transcripts_bin" "$@"
+fi
+
+# A shared model default uses each harness's native --model option. Explicit
+# model arguments, including Codex config overrides, take precedence.
+model_default_flags() {
+  local argument previous=
+  agent_model_flags=()
+  [[ -n "${AGENT_MODEL:-}" ]] || return 0
+  for argument in "$@"; do
+    [[ "$argument" != -- ]] || break
+    case "$argument" in
+      --model|--model=*) return 0 ;;
+      -m*) [[ "$agent_bin" == claude ]] || return 0 ;;
+    esac
+    if [[ "$agent_bin" == codex ]]; then
+      if [[ "$previous" == -c || "$previous" == --config ]]; then
+        [[ ! "$argument" =~ ^model[[:space:]]*= ]] || return 0
+      fi
+      [[ ! "$argument" =~ ^(--config=|-c)model[[:space:]]*= ]] || return 0
+    fi
+    previous="$argument"
+  done
+  agent_model_flags=(--model "$AGENT_MODEL")
+}
+
+# Current subscription-limit utilization is informational and independent of
+# harness launch preparation. Resolve the sibling in both the source tree and
+# the wrapped Nix output, then leave before process labeling or tmux setup.
+if [[ "${1:-}" == usage ]]; then
+  shift
+  agent_usage_bin="${AGENT_USAGE_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/agent-usage}"
+  if [[ ! -x "$agent_usage_bin" ]]; then
+    echo "agent usage: helper is not executable: $agent_usage_bin" >&2
+    exit 2
+  fi
+  "$agent_usage_bin" "$@"
+  exit $?
+fi
+
+# Worktree context describes the harness that this invocation starts. Do not
+# pass a parent agent's context to a child that runs in place. These are
+# legacy managed-worktree variables; the launcher no longer sets them, and it
+# clears any that arrive from an old environment.
+unset \
+  AGENT_WORKTREE \
+  AGENT_WORKTREE_BRANCH \
+  AGENT_PARENT_WORKTREE \
+  AGENT_PARENT_BRANCH \
+  AGENT_PARENT_UPSTREAM \
+  AGENT_PARENT_PUSH
+
+# Live session observation runs in Python and shares the transcript readers.
+if [[ "${1:-}" == "__title-watch" ]]; then
+  shift
+  exec "$agent_transcripts_dir/agent_sessions.py" "$@"
+fi
+
+# Start the terminal editor only when the compose pane has its useful size.
+run_agent_compose_editor() {
+  local editor_command="${1:-}" ready state attached window_size default_size
+  local pane_size tty_size
+
+  if [[ $# -ne 1 || -z "$editor_command" ]]; then
+    echo 'usage: agent __compose-editor EDITOR-COMMAND' >&2
+    return 2
+  fi
+
+  # The new editor pane exists before the shell below it does. Do not start a
+  # terminal editor until the launcher has completed that split and marked the
+  # sidecar ready, or the editor observes the transient full-height pty.
+  if [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]]; then
+    while :; do
+      ready="$(
+        tmux show-options -pqv -t "$TMUX_PANE" @agent_compose_ready 2>/dev/null || true
+      )"
+      [[ "$ready" != 1 ]] || break
+      tmux display-message -p -t "$TMUX_PANE" '#{pane_id}' >/dev/null 2>&1 || break
+      sleep 0.02
+    done
+
+    # A detached tmux session starts at default-size (normally 80x24), then
+    # grows when its first client selects it. Starting the editor at the
+    # placeholder size leaves some terminal editors with a tiny initial frame.
+    # An explicitly sized detached window is already ready for a TUI.
+    default_size="$(tmux show-options -gv default-size 2>/dev/null || true)"
+    while [[ -n "$default_size" ]]; do
+      state="$(
+        tmux display-message -p -t "$TMUX_PANE" \
+          '#{session_attached} #{window_width}x#{window_height}' 2>/dev/null
+      )" || break
+      read -r attached window_size <<< "$state"
+      [[ "$attached" != 0 || "$window_size" != "$default_size" ]] || {
+        sleep 0.02
+        continue
+      }
+      break
+    done
+
+    # tmux can commit a new layout just before the kernel applies the matching
+    # PTY window size. Wait for both views to agree after every possible resize
+    # so the editor's first terminal-size query cannot observe stale geometry.
+    while :; do
+      pane_size="$(
+        tmux display-message -p -t "$TMUX_PANE" \
+          '#{pane_height} #{pane_width}' 2>/dev/null
+      )" || break
+      tty_size="$(stty size 2>/dev/null || true)"
+      [[ -z "$tty_size" || "$tty_size" == "$pane_size" ]] && break
+      sleep 0.02
+    done
+  fi
+
+  exec "$BASH" -c "$editor_command"
+}
+
+if [[ "${1:-}" == "__compose-editor" ]]; then
+  shift
+  set +e
+  run_agent_compose_editor "$@"
+  exit $?
+fi
+
+# Editor-pane companion: deliver the draft text below the last marker line
+# (three or more dashes) to the agent pane. Text above the last marker is
+# private notes. See the COMPOSE PANE section of agent(lab-reference).
+run_agent_compose_send() {
+  local draft="${1:-}" target payload buffer
+  local -a agent_panes
+
+  if [[ $# -gt 1 ]]; then
+    echo 'usage: agent send [DRAFT-FILE]' >&2
+    return 2
+  fi
+  if [[ -z "${TMUX:-}" || -z "${TMUX_PANE:-}" ]]; then
+    echo 'agent send: not inside a tmux pane.' >&2
+    return 2
+  fi
+  if [[ -z "$draft" ]]; then
+    draft="$(tmux show-options -pqv -t "$TMUX_PANE" @agent_compose_draft 2>/dev/null || true)"
+  fi
+  if [[ -z "$draft" || ! -r "$draft" ]]; then
+    echo "agent send: no readable draft file${draft:+: $draft}." >&2
+    return 2
+  fi
+
+  target="$(tmux show-options -pqv -t "$TMUX_PANE" @agent_compose_target 2>/dev/null || true)"
+  if [[ -z "$target" ]]; then
+    # Fallback: the one pane tmux.agent-pane-center marked as the agent.
+    mapfile -t agent_panes < <(
+      tmux list-panes -t "$TMUX_PANE" -F $'#{pane_id}\t#{@agent_center_role}' 2>/dev/null |
+        awk -F '\t' '$2 == "agent" { print $1 }'
+    )
+    if [[ "${#agent_panes[@]}" -ne 1 ]]; then
+      echo 'agent send: cannot find the agent pane; this pane carries no @agent_compose_target.' >&2
+      return 2
+    fi
+    target="${agent_panes[0]}"
+  fi
+  if ! tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1; then
+    echo "agent send: agent pane $target is gone." >&2
+    return 2
+  fi
+
+  payload="$(awk '
+    /^---+$/ { marker = NR }
+    { line[NR] = $0 }
+    END {
+      first = marker + 1; last = NR
+      while (first <= last && line[first] ~ /^[[:space:]]*$/) first++
+      while (last >= first && line[last] ~ /^[[:space:]]*$/) last--
+      for (i = first; i <= last; i++) print line[i]
+    }' "$draft")"
+  if [[ -z "${payload//[[:space:]]/}" ]]; then
+    echo 'agent send: nothing to send below the last marker.' >&2
+    return 1
+  fi
+
+  # Bracketed paste keeps the embedded newlines out of the harness composer's
+  # submit path; the separate unmodified Enter submits exactly once.
+  buffer="agent-compose-$$-$RANDOM"
+  printf '%s' "$payload" | tmux load-buffer -b "$buffer" - || return 1
+  tmux paste-buffer -d -b "$buffer" -t "$target" || return 1
+  sleep "${AGENT_COMPOSE_SETTLE_SECONDS:-0.25}"
+  tmux send-keys -t "$target" Enter
+}
+
+if [[ "${1:-}" == "send" ]]; then
+  shift
+  set +e
+  run_agent_compose_send "$@"
+  exit $?
+fi
+
+agent_roles=()
+agent_native_arguments=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --)
+      agent_native_arguments=1
+      shift
+      break
+      ;;
+    --no-update)
+      shift
+      ;;
+    --role)
+      if [[ $# -lt 2 ]]; then
+        echo "agent: --role requires a role name." >&2
+        exit 2
+      fi
+      agent_roles+=("$2")
+      shift 2
+      ;;
+    --role=*)
+      agent_roles+=("${1#--role=}")
+      shift
+      ;;
+    --here|--no-worktree)
+      # Accepted for compatibility: the launcher no longer creates worktrees,
+      # so every invocation runs here.
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+for agent_role in "${agent_roles[@]}"; do
+  if [[ -z "$agent_role" ||
+        ! "$agent_role" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "agent: invalid role name '$agent_role'." >&2
+    exit 2
+  fi
+done
+
+if [[ "$agent_native_arguments" -eq 0 && "${1:-}" == "pi-bonsai" ]]; then
+  echo "The pi-bonsai selector was removed; use 'agent pi -m bonsai-8b-q1'." >&2
+  exit 2
+fi
+
+if [[ "$agent_native_arguments" -eq 0 && "${1:-}" == "resume" ]]; then
+  shift
+  resume_roles=()
+  for agent_role in "${agent_roles[@]}"; do
+    resume_roles+=(--role "$agent_role")
+  done
+  agent_launcher="$(readlink -f -- "${BASH_SOURCE[0]}")"
+  exec "$agent_transcripts_dir/agent_sessions.py" resume \
+    --agent "$agent_launcher" --transcripts "$agent_transcripts_bin" \
+    "${resume_roles[@]}" "$@"
+fi
+
+if [[ "$agent_native_arguments" -eq 0 &&
+      ( "${1:-}" == "codex" || "${1:-}" == "claude" || "${1:-}" == "pi" ) ]]; then
+  agent_bin="$1"
+  shift
+fi
+
+# The resolved harness, for anything the agent runs that needs to name itself.
+# AGENT_BIN stays an input that selects a default; this is the answer.
+export AGENT_HARNESS="$agent_bin"
+
+while [[ "$agent_native_arguments" -eq 0 && $# -gt 0 ]]; do
+  case "$1" in
+    --no-update)
+      shift
+      ;;
+    --here|--no-worktree)
+      # Accepted for compatibility: the launcher no longer creates worktrees,
+      # so every invocation runs here.
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+agent_invocation_is_informational() {
+  local arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --)
+        break
+        ;;
+      --print-instructions|-h|--help|-V|--version)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+claude_persistent_interactive_invocation() {
+  local arg
+
+  [[ -t 0 && -t 1 ]] || return 1
+  agent_invocation_is_informational "$@" && return 1
+  for arg in "$@"; do
+    case "$arg" in
+      -p|--print|--bg|--background|agents|auth|auto-mode|doctor|gateway|install|mcp|plugin|plugins|project|setup-token|ultrareview|update|upgrade)
+        return 1
+        ;;
+    esac
+  done
+  return 0
+}
+
+pi_persistent_interactive_invocation() {
+  local arg previous=""
+
+  [[ -t 0 && -t 1 ]] || return 1
+  agent_invocation_is_informational "$@" && return 1
+  for arg in "$@"; do
+    case "$arg" in
+      -p|--print|--no-session|--export|--export=*|--list-models|--list-models=*|install|remove|uninstall|update|list|config)
+        return 1
+        ;;
+      --mode=json|--mode=rpc)
+        return 1
+        ;;
+      json|rpc)
+        [[ "$previous" == --mode ]] && return 1
+        ;;
+    esac
+    previous="$arg"
+  done
+  return 0
+}
+
+valid_claude_uuid() {
+  [[ "$1" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]
+}
+
+start_agent_process_collection() {
+  local labeler=${AGENT_PROCESS_LABELER:-}
+
+  agent_invocation_is_informational "$@" && return 0
+  [[ -n $labeler ]] || return 0
+
+  if [[ ${AGENT_PROCESS_LABEL_PID:-} == "$$" ]]; then
+    unset AGENT_PROCESS_LABEL_PID AGENT_PROCESS_LABEL_STATUS
+    return 0
+  fi
+  unset AGENT_PROCESS_LABEL_PID AGENT_PROCESS_LABEL_STATUS
+
+  if [[ ! -x $labeler ]]; then
+    echo "agent: process audit degraded: label helper is not executable: $labeler" >&2
+    return 0
+  fi
+  if ! exec "$labeler" "${agent_original_argv[@]}"; then
+    echo 'agent: process audit degraded: could not execute the label helper' >&2
+  fi
+}
+
+start_agent_process_collection "$@"
+
+agent_session_slug=
+start_agent_identity() {
+  agent_invocation_is_informational "$@" && return 0
+  [[ "$(git -C "$launch_dir" rev-parse --is-inside-work-tree 2>/dev/null)" == true ]] || return 0
+  agent_session_slug="$(date +%Y%m%d-%H%M%S)-$RANDOM$RANDOM"
+  export GIT_AUTHOR_NAME="$agent_bin $agent_session_slug"
+  export GIT_AUTHOR_EMAIL="$agent_bin.$agent_session_slug@${AGENT_MAIL_DOMAIN:-agents.example.invalid}"
+}
+
+start_agent_identity "$@"
+
+interactive_agent_invocation() {
+  local arg
+
+  [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" && -t 0 && -t 1 ]] || return 1
+  for arg in "$@"; do
+    case "$agent_bin:$arg" in
+      *:--print-instructions|codex:exec|codex:review|claude:-p|claude:--print|pi:-p|pi:--print)
+        return 1
+        ;;
+    esac
+  done
+}
+
+set_initial_agent_title() {
+  interactive_agent_invocation "$@" || return 0
+  tmux set-option -wq -t "$TMUX_PANE" @agent_title_mode auto >/dev/null 2>&1 || true
+  tmux rename-window -t "$TMUX_PANE" -- agent >/dev/null 2>&1 || true
+}
+
+set_initial_agent_title "$@"
+
+# With AGENT_COMPOSE set, a lone interactive agent pane gets a companion
+# editor pane on the session's scratch file: read in the agent pane, compose
+# in the editor, deliver with `agent send`. The split lands before
+# tmux.agent-pane-center runs, so centering yields to it by its own rules.
+set_initial_agent_compose_pane() {
+  local editor session_dir draft_file draft_arg editor_pane shell_pane pane_count
+  local agent_launcher agent_launcher_arg editor_command editor_command_arg editor_launch
+
+  interactive_agent_invocation "$@" || return 0
+  case "${AGENT_COMPOSE:-}" in
+    ''|0|false) return 0 ;;
+    1|true)     editor="${EDITOR:-vi}" ;;
+    *)          editor="$AGENT_COMPOSE" ;;
+  esac
+
+  # Only a lone agent gets a companion. Spacer panes from
+  # tmux.agent-pane-center (a re-exec through `agent resume` meets them)
+  # do not count as company; anything else does, including an editor pane
+  # from an earlier launch in this window.
+  pane_count="$(tmux list-panes -t "$TMUX_PANE" -F '#{@agent_center_role}' 2>/dev/null |
+    grep -cv '^spacer$' || true)"
+  [[ "$pane_count" == 1 ]] || return 0
+
+  session_dir="$(
+    tmux display-message -p -t "$TMUX_PANE" '#{session_path}' 2>/dev/null
+  )" || return 0
+  [[ -d "$session_dir" ]] || return 0
+  draft_file="$session_dir/.agent-compose-send"
+  if [[ ! -e "$draft_file" ]]; then
+    (umask 077; : > "$draft_file") 2>/dev/null || return 0
+  fi
+
+  # $editor is a shell command line, so a value like "emacsclient -t"
+  # works. Keep the shell-quoted draft in the pane's start command: a world
+  # adoption or manual respawn may replace the pane environment before this
+  # command runs. Single quotes work in both the configured fish shell and
+  # POSIX shells; close and reopen them around any quote in the session path.
+  draft_arg="${draft_file//\'/\'\\\'\'}"
+  draft_arg="'$draft_arg'"
+  editor_command="exec $editor $draft_arg"
+  if command -v isolate-exec >/dev/null 2>&1; then
+    editor_command="exec isolate-exec $editor $draft_arg"
+  fi
+
+  # Run the small wait helper outside the world, then enter the world with the
+  # editor after tmux has established the final sidecar geometry. Keep both
+  # command arguments portable across the configured fish and POSIX shells.
+  agent_launcher="$(readlink -f -- "${BASH_SOURCE[0]}")" || return 0
+  agent_launcher_arg="${agent_launcher//\'/\'\\\'\'}"
+  editor_command_arg="${editor_command//\'/\'\\\'\'}"
+  editor_launch="exec '$agent_launcher_arg' __compose-editor '$editor_command_arg'"
+  editor_pane="$(
+    tmux split-window -h -d -c "$session_dir" -t "$TMUX_PANE" \
+      -P -F '#{pane_id}' "$editor_launch" 2>/dev/null
+  )" || return 0
+  tmux set-option -pq -t "$editor_pane" @agent_compose_role editor 2>/dev/null || true
+  tmux set-option -pq -t "$editor_pane" @agent_compose_target "$TMUX_PANE" 2>/dev/null || true
+  tmux set-option -pq -t "$editor_pane" @agent_compose_draft "$draft_file" 2>/dev/null || true
+
+  # A shell fills the bottom half of the sidecar. It runs no command, so the
+  # session's default shell starts and its world join hook applies like any
+  # plain pane. It carries the same options, so `agent send` works from it.
+  shell_pane="$(
+    tmux split-window -v -d -c "$session_dir" -t "$editor_pane" \
+      -P -F '#{pane_id}' 2>/dev/null
+  )" || return 0
+  tmux set-option -pq -t "$shell_pane" @agent_compose_role shell 2>/dev/null || true
+  tmux set-option -pq -t "$shell_pane" @agent_compose_target "$TMUX_PANE" 2>/dev/null || true
+  tmux set-option -pq -t "$shell_pane" @agent_compose_draft "$draft_file" 2>/dev/null || true
+  tmux set-option -pq -t "$editor_pane" @agent_compose_ready 1 2>/dev/null || true
+}
+
+set_initial_agent_compose_pane "$@"
+
+# A lone interactive agent pane reads better at about half the window width.
+# The helper centers the pane between inert spacers and keeps that through
+# window hooks; it is a no-op when absent, disabled, or beside other panes.
+# See tmux.agent-pane-center(lab-reference).
+set_initial_agent_pane_layout() {
+  interactive_agent_invocation "$@" || return 0
+  [[ "${TMUX_AGENT_PANE_CENTER:-1}" != 0 ]] || return 0
+  command -v tmux.agent-pane-center >/dev/null 2>&1 || return 0
+  tmux.agent-pane-center apply --pane "$TMUX_PANE" >/dev/null 2>&1 || true
+}
+
+set_initial_agent_pane_layout "$@"
+
+# Facts that a .md.tmpl instruction file reads with {{fact "NAME"}}. These are
+# the values only this launcher knows; agent.template answers host and user by
+# itself. Build the list after the harness selector and the worktree are
+# settled. See man lab-reference agent.template.
+agent_template_facts=()
+set_agent_template_facts() {
+  local git_root="$1"
+
+  agent_template_facts=(
+    -fact "harness=$agent_bin"
+    -fact "roles=${agent_roles[*]:-}"
+    -fact "gitroot=$git_root"
+    -fact "launch_dir=$launch_dir"
+    -fact "worktree=${AGENT_WORKTREE:-}"
+    -fact "worktree_branch=${AGENT_WORKTREE_BRANCH:-}"
+    -fact "parent_branch=${AGENT_PARENT_BRANCH:-}"
+  )
+}
+
+render_instruction_template() {
+  local path="$1"
+
+  if ! command -v "$agent_template_bin" >/dev/null 2>&1; then
+    echo "agent: $path needs $agent_template_bin, which is not available." >&2
+    exit 2
+  fi
+  "$agent_template_bin" "${agent_template_facts[@]}" -- "$path"
+}
+
+# Resolve one instruction file that can exist as plain Markdown or as a
+# template. Both forms at one time is a configuration mistake, not a merge.
+# Print nothing when neither form exists.
+resolve_instruction_file() {
+  local base="$1"
+
+  if [[ -f "$base" && -f "$base.tmpl" ]]; then
+    echo "agent: $base exists as both Markdown and a template." >&2
+    exit 2
+  fi
+  if [[ -f "$base" ]]; then
+    printf '%s\n' "$base"
+  elif [[ -f "$base.tmpl" ]]; then
+    printf '%s\n' "$base.tmpl"
+  fi
+}
+
+append_instruction_file() {
+  local path="$1"
+  local content
+
+  [[ -n "$path" && -f "$path" ]] || return 0
+  if [[ "$path" == *.md.tmpl ]]; then
+    # An unreadable file stays silently disabled, as for plain Markdown. A
+    # file that is readable and broken is fatal: starting a harness with a
+    # damaged prompt prefix is worse than not starting it.
+    [[ -r "$path" ]] || return 0
+    content="$(render_instruction_template "$path")" || exit 2
+  else
+    content="$(cat -- "$path" 2>/dev/null)" || return 0
+  fi
+  [[ -n "$content" ]] || return 0
+  if [[ -n "$agent_instructions" ]]; then
+    agent_instructions+=$'\n\n'
+  fi
+  agent_instructions+="$content"
+}
+
+collect_agent_instructions() {
+  local raw_path path main_file drop_in_dir fragment base role role_file
+  local git_root=""
+  local role_found
+  local LC_ALL=C
+  local -a agent_paths fragments instruction_paths
+
+  if git_root="$(git -C "$launch_dir" rev-parse --show-toplevel 2>/dev/null)"; then
+    git_root="$(cd "$git_root" && pwd -P)"
+  else
+    git_root=""
+  fi
+
+  set_agent_template_facts "$git_root"
+
+  IFS=: read -r -a agent_paths <<<"$agent_path"
+  for raw_path in "${agent_paths[@]}"; do
+    [[ -n "$raw_path" ]] || continue
+    case "$raw_path" in
+      '$gitroot'|'$gitroot/'*|'${gitroot}'|'${gitroot}/'*)
+        [[ -n "$git_root" ]] || continue
+        path="${raw_path/\$\{gitroot\}/$git_root}"
+        path="${path/\$gitroot/$git_root}"
+        ;;
+      '~')
+        path="$HOME"
+        ;;
+      '~/'*)
+        path="$HOME/${raw_path#\~/}"
+        ;;
+      /*)
+        path="$raw_path"
+        ;;
+      '.')
+        path="$launch_dir"
+        ;;
+      './'*)
+        path="$launch_dir/${raw_path#./}"
+        ;;
+      *)
+        path="$launch_dir/$raw_path"
+        ;;
+    esac
+
+    path="${path%/.}"
+    if [[ "$path" != "/" ]]; then
+      path="${path%/}"
+    fi
+    drop_in_dir="$path/AGENTS.md.d"
+
+    for base in "${instruction_paths[@]:-}"; do
+      [[ "$base" != "$path" ]] || continue 2
+    done
+    instruction_paths+=("$path")
+
+    main_file="$(resolve_instruction_file "$path/AGENTS.md")" || exit 2
+    append_instruction_file "$main_file"
+    if [[ -d "$drop_in_dir" ]]; then
+      shopt -s nullglob
+      fragments=("$drop_in_dir"/*)
+      shopt -u nullglob
+      for fragment in "${fragments[@]}"; do
+        case "$(basename "$fragment")" in
+          role-*.md|role-*.md.tmpl)
+            continue
+            ;;
+        esac
+        append_instruction_file "$fragment"
+      done
+    fi
+  done
+
+  for role in "${agent_roles[@]}"; do
+    role_found=0
+    for path in "${instruction_paths[@]}"; do
+      role_file="$(resolve_instruction_file "$path/AGENTS.md.d/role-$role.md")" || exit 2
+      [[ -n "$role_file" ]] || continue
+      append_instruction_file "$role_file"
+      role_found=1
+    done
+    if [[ "$role_found" -ne 1 ]]; then
+      echo "agent: unknown role '$role'." >&2
+      exit 2
+    fi
+  done
+}
+
+agent_instructions=""
+collect_agent_instructions
+
+run_harnesh_turn() {
+  local session=""
+  local selected_harness="$agent_bin"
+  local native_session=""
+  local prompt response session_id stream_file response_file schema_file
+  local temporary agent_cli
+  local -a harness_args
+
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --session)
+        if [[ $# -lt 2 || -n "$session" ]]; then
+          echo 'agent: --harnesh-turn --session requires one session ID.' >&2
+          return 2
+        fi
+        session="$2"
+        shift 2
+        ;;
+      --session=*)
+        if [[ -n "$session" ]]; then
+          echo 'agent: --harnesh-turn --session was specified more than once.' >&2
+          return 2
+        fi
+        session="${1#--session=}"
+        shift
+        ;;
+      *)
+        echo "agent: unknown --harnesh-turn argument '$1'." >&2
+        return 2
+        ;;
+    esac
+  done
+
+  if [[ -n "$session" ]]; then
+    if [[ "$session" != *:* ]]; then
+      echo "agent: invalid Harnesh session ID '$session'." >&2
+      return 2
+    fi
+    selected_harness="${session%%:*}"
+    native_session="${session#*:}"
+    if [[ -z "$native_session" ||
+          ! "$native_session" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "agent: invalid Harnesh session ID '$session'." >&2
+      return 2
+    fi
+  fi
+  case "$selected_harness" in
+    codex|claude|pi)
+      ;;
+    *)
+      echo "agent: Harnesh does not support harness '$selected_harness'." >&2
+      return 2
+      ;;
+  esac
+
+  prompt="$(cat)"
+  if [[ -z "${prompt//[[:space:]]/}" ]]; then
+    echo 'agent: --harnesh-turn requires a prompt on standard input.' >&2
+    return 2
+  fi
+
+  temporary="$(mktemp -d "${TMPDIR:-/tmp}/agent-harnesh.XXXXXX")"
+  chmod 700 "$temporary"
+  stream_file="$temporary/stream.jsonl"
+  response_file="$temporary/response.json"
+  schema_file="$temporary/schema.json"
+  trap 'rm4agent -r "$temporary" >/dev/null 2>&1 || true' RETURN
+  cat > "$schema_file" <<'EOF'
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "kind": { "type": "string", "enum": ["answer", "shell"] },
+    "answer": { "type": "string" },
+    "command": { "type": "string" }
+  },
+  "required": ["kind", "answer", "command"],
+  "additionalProperties": false
+}
+EOF
+  chmod 600 "$schema_file"
+
+  agent_cli="$0"
+  if [[ "$agent_cli" != */* ]]; then
+    agent_cli="$(command -v -- "$agent_cli")"
+  fi
+
+  case "$selected_harness" in
+    codex)
+      harness_args=(exec)
+      if [[ -n "$native_session" ]]; then
+        harness_args+=(resume)
+      fi
+      harness_args+=(
+        --json
+        --skip-git-repo-check
+        --output-schema "$schema_file"
+        --output-last-message "$response_file"
+      )
+      if [[ -n "$native_session" ]]; then
+        harness_args+=("$native_session")
+      fi
+      harness_args+=(-)
+      if ! printf '%s' "$prompt" |
+        AGENT_PROCESS_LABELER= "$agent_cli" --here codex "${harness_args[@]}" \
+          > "$stream_file"; then
+        echo 'agent: Codex Harnesh turn failed.' >&2
+        return 1
+      fi
+      session_id="$(
+        jq -sr '[.[] | select(.type == "thread.started") | .thread_id] | last // empty' \
+          "$stream_file"
+      )"
+      if [[ -n "$native_session" && "$session_id" != "$native_session" ]]; then
+        echo "agent: Codex resumed '$session_id' instead of '$native_session'." >&2
+        return 1
+      fi
+      response="$(jq -ce . "$response_file")" || {
+        echo 'agent: Codex returned invalid Harnesh JSON.' >&2
+        return 1
+      }
+      ;;
+    pi)
+      harness_args=(--mode json)
+      if [[ -n "$native_session" ]]; then
+        harness_args+=(--session "$native_session")
+      fi
+      if ! printf '%s' "$prompt" |
+        AGENT_PROCESS_LABELER= "$agent_cli" --here pi "${harness_args[@]}" \
+          > "$stream_file"; then
+        echo 'agent: Pi Harnesh turn failed.' >&2
+        return 1
+      fi
+      session_id="$(
+        jq -sr '[.[] | select(.type == "session") | .id] | first // empty' \
+          "$stream_file"
+      )"
+      if [[ -n "$native_session" && "$session_id" != "$native_session" ]]; then
+        echo "agent: Pi resumed '$session_id' instead of '$native_session'." >&2
+        return 1
+      fi
+      response="$(
+        jq -sr '
+          [.[] |
+            select(.type == "message_end" and .message.role == "assistant") |
+            [.message.content[]? | select(.type == "text") | .text] | join("")
+          ] | last // empty | fromjson
+        ' "$stream_file"
+      )" || {
+        echo 'agent: Pi returned invalid Harnesh JSON.' >&2
+        return 1
+      }
+      ;;
+    claude)
+      harness_args=(
+        --print
+        --output-format json
+        --json-schema "$(jq -c . "$schema_file")"
+      )
+      if [[ -n "$native_session" ]]; then
+        harness_args+=(--resume "$native_session")
+      fi
+      if ! printf '%s' "$prompt" |
+        AGENT_PROCESS_LABELER= "$agent_cli" --here claude "${harness_args[@]}" \
+          > "$stream_file"; then
+        echo 'agent: Claude Harnesh turn failed.' >&2
+        return 1
+      fi
+      session_id="$(jq -sr 'last | .session_id // empty' "$stream_file")"
+      if [[ -n "$native_session" && "$session_id" != "$native_session" ]]; then
+        echo "agent: Claude resumed '$session_id' instead of '$native_session'." >&2
+        return 1
+      fi
+      response="$(
+        jq -sce 'last | .structured_output // (.result | fromjson)' "$stream_file"
+      )" || {
+        echo 'agent: Claude returned invalid Harnesh JSON.' >&2
+        return 1
+      }
+      ;;
+  esac
+
+  if [[ -z "$session_id" || ! "$session_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "agent: $selected_harness did not return a native session ID." >&2
+    return 1
+  fi
+  if ! jq -e '
+    type == "object" and
+    ((.kind == "answer" and (.answer | type == "string" and length > 0) and .command == "") or
+     (.kind == "shell" and .answer == "" and (.command | type == "string" and length > 0))) and
+    (keys | sort) == ["answer", "command", "kind"]
+  ' >/dev/null <<<"$response"; then
+    echo "agent: $selected_harness returned an invalid Harnesh response." >&2
+    return 1
+  fi
+
+  jq -cn \
+    --arg harness "$selected_harness" \
+    --arg session_id "$selected_harness:$session_id" \
+    --argjson response "$response" \
+    '$response + {harness: $harness, session_id: $session_id}'
+}
+
+if [[ -n "$agent_session_slug" ]]; then
+  agent_git_root="$(git -C "$launch_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  agent_git_branch="$(git -C "$launch_dir" branch --show-current 2>/dev/null || true)"
+  agent_instructions+="${agent_instructions:+$'\n\n'}You are working in the Git checkout at ${agent_git_root:-$launch_dir} on branch ${agent_git_branch:-a detached HEAD}.
+
+Before changing tracked files, work on a non-deployment feature branch. If the checkout is on main, create or switch to a descriptively named branch with ordinary Git commands. Use focused commits and normal feature-branch pushes during development. A feature-branch push is only backup or collaboration; it does not request deployment. Do not deploy intermediate units or deploy only to save work.
+
+Run git.deploy -m 'MESSAGE' once, only after all requested work in the current development cycle is complete, focused tests pass, and the result is ready for main and its production path. Write MESSAGE as a specific one-line summary of the change; it becomes the subject of the commit. The command commits all changes, submits the original branch and remote main to the merge queue, runs make test on the assigned merge, and pushes the exact tested commit to main. Omit -m only when you already committed every change with clear messages. If deployment fails, correct the failure on the feature branch and retry only when the complete cycle is ready again."
+fi
+
+start_matrix_agent_lifecycle() {
+  local bridge session_key session_name window_id state_dir bridge_log
+
+  [[ "${AGENT_MATRIX_TMUX_ENABLE:-1}" == 1 ]] || return 0
+  interactive_agent_invocation "$@" || return 0
+  bridge="$(command -v matrix-agent-tmux 2>/dev/null || true)"
+  [[ -n "$bridge" && -x "$bridge" ]] || return 0
+  session_key="$(tmux display-message -p -t "$TMUX_PANE" '#{session_id}:#{session_created}' 2>/dev/null)" || return 0
+  session_name="$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null)" || return 0
+  window_id="$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null)" || return 0
+  state_dir="${XDG_RUNTIME_DIR:-/tmp}/agent-window-titles-${UID}"
+  mkdir -p "$state_dir" 2>/dev/null || true
+  bridge_log="$state_dir/${TMUX_PANE#%}.matrix-register.log"
+  if ! "$bridge" start \
+    --pane "$TMUX_PANE" \
+    --window-id "$window_id" \
+    --pid "$$" \
+    --harness "$agent_bin" \
+    --session-key "$session_key" \
+    --session-name "$session_name" \
+    --workspace "$launch_dir" \
+    </dev/null >>"$bridge_log" 2>&1; then
+    # Matrix is an optional relay around the harness. Keep the diagnostic in
+    # its dedicated log, but never put a terminal error screen in front of an
+    # otherwise healthy interactive agent when the relay is unavailable.
+    return 0
+  fi
+}
+
+# Bind title watchers to a native session whenever the invocation already
+# names one. Claude also accepts a launcher-assigned id for new sessions.
+agent_title_session_id=""
+agent_claude_session_id=""
+agent_claude_display_name=""
+prepare_agent_title_session_id() {
+  local arg index candidate custom_name="" selector_id=""
+  local selector_count=0 selector_unknown=0
+  local -a identity_args=("$@")
+
+  case "$agent_bin" in
+    codex)
+      interactive_agent_invocation "$@" || return 0
+      for ((index = 0; index < ${#identity_args[@]}; index++)); do
+        if [[ "${identity_args[index]}" == resume &&
+              $((index + 1)) -lt ${#identity_args[@]} ]]; then
+          candidate="${identity_args[index + 1]}"
+          if [[ "$candidate" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            agent_title_session_id="$candidate"
+          fi
+          return 0
+        fi
+      done
+      ;;
+    claude)
+      claude_persistent_interactive_invocation "$@" || return 0
+      if [[ -n "${AGENT_CLAUDE_FLAGS:-}" ]]; then
+        read -r -a identity_args <<<"$AGENT_CLAUDE_FLAGS"
+        identity_args+=("$@")
+      fi
+      for ((index = 0; index < ${#identity_args[@]}; index++)); do
+        arg="${identity_args[index]}"
+        case "$arg" in
+          --)
+            break
+            ;;
+          --name=*|-n=*)
+            custom_name="${arg#*=}"
+            ;;
+          -n|--name)
+            if ((index + 1 < ${#identity_args[@]})); then
+              ((index += 1))
+              custom_name="${identity_args[index]}"
+            fi
+            ;;
+          --session-id=*)
+            ((selector_count += 1))
+            candidate="${arg#*=}"
+            if valid_claude_uuid "$candidate"; then
+              selector_id="$candidate"
+            else
+              selector_unknown=1
+            fi
+            ;;
+          --session-id)
+            ((selector_count += 1))
+            if ((index + 1 < ${#identity_args[@]})); then
+              ((index += 1))
+              candidate="${identity_args[index]}"
+              if valid_claude_uuid "$candidate"; then
+                selector_id="$candidate"
+              else
+                selector_unknown=1
+              fi
+            else
+              selector_unknown=1
+            fi
+            ;;
+          --resume=*|-r=*)
+            ((selector_count += 1))
+            candidate="${arg#*=}"
+            if valid_claude_uuid "$candidate"; then
+              selector_id="$candidate"
+            else
+              selector_unknown=1
+            fi
+            ;;
+          -r|--resume)
+            ((selector_count += 1))
+            if ((index + 1 < ${#identity_args[@]})) &&
+              [[ "${identity_args[index + 1]}" != -* ]]; then
+              ((index += 1))
+              candidate="${identity_args[index]}"
+              if valid_claude_uuid "$candidate"; then
+                selector_id="$candidate"
+              else
+                selector_unknown=1
+              fi
+            else
+              selector_unknown=1
+            fi
+            ;;
+          -c|--continue|--fork-session|--from-pr|--from-pr=*)
+            ((selector_count += 1))
+            selector_unknown=1
+            ;;
+        esac
+      done
+
+      if [[ "$selector_unknown" -eq 0 && "$selector_count" -eq 0 ]]; then
+        IFS= read -r agent_claude_session_id < /proc/sys/kernel/random/uuid 2>/dev/null ||
+          agent_claude_session_id=""
+        selector_id="$agent_claude_session_id"
+      elif [[ "$selector_unknown" -ne 0 || "$selector_count" -ne 1 ]]; then
+        selector_id=""
+      fi
+
+      if [[ -n "$selector_id" ]]; then
+        agent_title_session_id="$selector_id"
+        if [[ -z "$custom_name" ]]; then
+          agent_claude_display_name="$selector_id"
+        elif [[ "$custom_name" == *" · $selector_id" ]]; then
+          agent_claude_display_name="$custom_name"
+        else
+          agent_claude_display_name="$custom_name · $selector_id"
+        fi
+      fi
+      ;;
+    pi)
+      interactive_agent_invocation "$@" || return 0
+      if [[ -n "${AGENT_PI_FLAGS:-}" ]]; then
+        read -r -a identity_args <<<"$AGENT_PI_FLAGS"
+        identity_args+=("$@")
+      fi
+      for ((index = 0; index < ${#identity_args[@]}; index++)); do
+        arg="${identity_args[index]}"
+        case "$arg" in
+          --session=*)
+            candidate="${arg#*=}"
+            if [[ "$candidate" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+              agent_title_session_id="$candidate"
+            fi
+            return 0
+            ;;
+          --session)
+            if ((index + 1 < ${#identity_args[@]})); then
+              candidate="${identity_args[index + 1]}"
+              if [[ "$candidate" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                agent_title_session_id="$candidate"
+              fi
+            fi
+            return 0
+            ;;
+        esac
+      done
+      ;;
+  esac
+}
+
+start_agent_title_watcher() {
+  local agent_cli ready_file watcher_pid attempt session_name
+
+  interactive_agent_invocation "$@" || return 0
+  agent_cli="$0"
+  if [[ "$agent_cli" != */* ]]; then
+    agent_cli="$(command -v -- "$agent_cli" 2>/dev/null || true)"
+  fi
+  [[ -n "$agent_cli" && -x "$agent_cli" ]] || return 0
+  session_name="$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null)" || return 0
+
+  ready_file="$(mktemp "${TMPDIR:-/tmp}/agent-window-title.XXXXXX")"
+  rm -f "$ready_file"
+  "$agent_cli" __title-watch \
+    "$ready_file" "$agent_bin" "$TMUX_PANE" "$launch_dir" "$$" "$session_name" \
+    "$agent_title_session_id" \
+    </dev/null >/dev/null 2>&1 &
+  watcher_pid=$!
+
+  for attempt in {1..20}; do
+    [[ -e "$ready_file" ]] && break
+    kill -0 "$watcher_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  rm -f "$ready_file"
+}
+
+if [[ "${1:-}" == "--print-instructions" ]]; then
+  printf '%s\n' "$agent_instructions"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--harnesh-turn" ]]; then
+  run_harnesh_turn "$@"
+  exit $?
+fi
+
+prepare_agent_title_session_id "$@"
+start_matrix_agent_lifecycle "$@"
+start_agent_title_watcher "$@"
+
+if [[ "$agent_bin" == "codex" ]]; then
+  argv=("$@")
+  codex_config_flags=(-c check_for_update_on_startup=false)
+  if [[ -n "$agent_instructions" ]]; then
+    codex_config_flags+=(-c "developer_instructions=$agent_instructions")
+  fi
+
+  codex_working_dir="$launch_dir"
+  for ((index = 0; index < ${#argv[@]}; index++)); do
+    case "${argv[index]}" in
+      --)
+        break
+        ;;
+      -C|--cd)
+        if ((index + 1 < ${#argv[@]})); then
+          ((index += 1))
+          requested_dir="${argv[index]}"
+          if [[ "$requested_dir" != /* ]]; then
+            requested_dir="$launch_dir/$requested_dir"
+          fi
+          if [[ -d "$requested_dir" ]]; then
+            codex_working_dir="$(cd "$requested_dir" && pwd -P)"
+          fi
+        fi
+        ;;
+      --cd=*)
+        requested_dir="${argv[index]#--cd=}"
+        if [[ "$requested_dir" != /* ]]; then
+          requested_dir="$launch_dir/$requested_dir"
+        fi
+        if [[ -d "$requested_dir" ]]; then
+          codex_working_dir="$(cd "$requested_dir" && pwd -P)"
+        fi
+        ;;
+    esac
+  done
+
+  codex_trust_key_path=""
+  auto_trust_root="${AGENT_CODEX_AUTO_TRUST_ROOT-/srv/src}"
+  if [[ -n "$auto_trust_root" && -d "$auto_trust_root" ]]; then
+    auto_trust_root="$(cd "$auto_trust_root" && pwd -P)"
+    if codex_project_root="$(git -C "$codex_working_dir" rev-parse --show-toplevel 2>/dev/null)"; then
+      codex_project_root="$(cd "$codex_project_root" && pwd -P)"
+    else
+      codex_project_root="$codex_working_dir"
+    fi
+
+    if [[ -n "$codex_project_root" &&
+          ( "$codex_project_root" == "$auto_trust_root" ||
+            "$codex_project_root" == "$auto_trust_root/"* ) ]]; then
+      toml_project_root="${codex_project_root//\\/\\\\}"
+      toml_project_root="${toml_project_root//\"/\\\"}"
+      toml_project_root="${toml_project_root//$'\n'/\\n}"
+      toml_project_root="${toml_project_root//$'\r'/\\r}"
+      toml_project_root="${toml_project_root//$'\t'/\\t}"
+      codex_trust_key_path="projects.\"$toml_project_root\".trust_level"
+    fi
+  fi
+
+  npm_prefix="${NPM_CONFIG_PREFIX:-/usr/local/lib/npm}"
+  codex_path="${PATH:-}"
+
+  if [[ -r "$env_path" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" == PATH=* ]] || continue
+      codex_path="${line#PATH=}"
+      break
+    done <"$env_path"
+  fi
+
+  persist_codex_project_trust() {
+    local key_path="$1"
+    local request response writer_pid writer_stdout writer_stdin
+    local write_ok=0
+
+    if ! request="$(
+      jq -cn --arg key_path "$key_path" '{
+        method: "config/value/write",
+        id: 1,
+        params: {
+          keyPath: $key_path,
+          value: "trusted",
+          mergeStrategy: "upsert"
+        }
+      }'
+    )"; then
+      echo "agent: could not prepare Codex trust update for $codex_project_root" >&2
+      return 0
+    fi
+
+    coproc CODEX_CONFIG_WRITER {
+      /usr/bin/env PATH="$codex_path" NPM_CONFIG_PREFIX="$npm_prefix" \
+        codex -c check_for_update_on_startup=false \
+        app-server --listen stdio:// 2>/dev/null
+    }
+    writer_pid="$CODEX_CONFIG_WRITER_PID"
+    exec {writer_stdout}<&"${CODEX_CONFIG_WRITER[0]}"
+    exec {writer_stdin}>&"${CODEX_CONFIG_WRITER[1]}"
+
+    if ! printf '%s\n' \
+      '{"method":"initialize","id":0,"params":{"clientInfo":{"name":"agent","title":"Agent","version":"1"},"capabilities":null}}' \
+      '{"method":"initialized","params":{}}' \
+      "$request" >&"$writer_stdin"; then
+      exec {writer_stdin}>&-
+      exec {writer_stdout}<&-
+      kill "$writer_pid" 2>/dev/null || true
+      wait "$writer_pid" 2>/dev/null || true
+      echo "agent: could not send Codex trust update for $codex_project_root" >&2
+      return 0
+    fi
+
+    while IFS= read -r -t 10 response <&"$writer_stdout"; do
+      if jq -e '.id == 1 and .result.status == "ok"' \
+        >/dev/null 2>&1 <<<"$response"; then
+        write_ok=1
+        break
+      fi
+      if jq -e '.id == 1' >/dev/null 2>&1 <<<"$response"; then
+        break
+      fi
+    done
+
+    exec {writer_stdin}>&-
+    exec {writer_stdout}<&-
+    kill "$writer_pid" 2>/dev/null || true
+    wait "$writer_pid" 2>/dev/null || true
+    if [[ "$write_ok" -ne 1 ]]; then
+      echo "agent: could not persist Codex trust for $codex_project_root" >&2
+    fi
+  }
+
+  codex_project_trust_is_persisted() {
+    local config_file="${CODEX_HOME:-$HOME/.codex}/config.toml"
+    local project_header="[projects.\"$toml_project_root\"]"
+
+    [[ -r "$config_file" ]] || return 1
+    CODEX_TRUST_HEADER="$project_header" awk '
+      $0 == ENVIRON["CODEX_TRUST_HEADER"] {
+        in_project = 1
+        next
+      }
+      in_project && /^[[:space:]]*\[/ {
+        exit
+      }
+      in_project &&
+        /^[[:space:]]*trust_level[[:space:]]*=[[:space:]]*"trusted"[[:space:]]*$/ {
+        found = 1
+        exit
+      }
+      END {
+        exit !found
+      }
+    ' "$config_file"
+  }
+
+  if [[ -n "$codex_trust_key_path" ]] &&
+    ! codex_project_trust_is_persisted; then
+    persist_codex_project_trust "$codex_trust_key_path"
+  fi
+
+  agent_codex_flags=()
+  if [[ -n "${AGENT_CODEX_FLAGS:-}" ]]; then
+    read -r -a agent_codex_flags <<<"$AGENT_CODEX_FLAGS"
+  fi
+
+  codex_tui_invocation() {
+    local arg index
+
+    agent_invocation_is_informational "$@" && return 1
+    local -a invocation_args=("$@")
+    for ((index = 0; index < ${#invocation_args[@]}; index++)); do
+      arg="${invocation_args[index]}"
+      case "$arg" in
+        --)
+          return 0
+          ;;
+        -c|--config|--enable|--disable|-i|--image|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-C|--cd|--add-dir|-a|--ask-for-approval|--remote|--remote-auth-token-env)
+          ((index += 1))
+          ;;
+        -*)
+          ;;
+        resume|fork)
+          return 0
+          ;;
+        agents|exec|e|review|login|logout|mcp|plugin|mcp-server|app-server|remote-control|completion|update|doctor|sandbox|debug|apply|a|queue|archive|delete|migrate-rollouts|unarchive|cloud|exec-server|features|help)
+          return 1
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+    done
+    return 0
+  }
+
+  codex_config_sets_status_line() {
+    [[ "$1" =~ ^[[:space:]]*tui\.status_line[[:space:]]*= ]]
+  }
+
+  filter_codex_config_args() {
+    local input_name="$1" output_name="$2" query_name="$3"
+    local arg value index after_delimiter=0
+    local -n input_ref="$input_name" output_ref="$output_name" query_ref="$query_name"
+
+    output_ref=()
+    for ((index = 0; index < ${#input_ref[@]}; index++)); do
+      arg="${input_ref[index]}"
+      if [[ "$after_delimiter" -eq 1 ]]; then
+        output_ref+=("$arg")
+        continue
+      fi
+      case "$arg" in
+        --)
+          after_delimiter=1
+          output_ref+=("$arg")
+          ;;
+        -c|--config)
+          if ((index + 1 < ${#input_ref[@]})); then
+            ((index += 1))
+            value="${input_ref[index]}"
+            query_ref+=(-c "$value")
+            if ! codex_config_sets_status_line "$value"; then
+              output_ref+=("$arg" "$value")
+            fi
+          else
+            output_ref+=("$arg")
+          fi
+          ;;
+        -c=*|--config=*)
+          value="${arg#*=}"
+          query_ref+=(-c "$value")
+          if ! codex_config_sets_status_line "$value"; then
+            output_ref+=("$arg")
+          fi
+          ;;
+        -p|--profile)
+          output_ref+=("$arg")
+          if ((index + 1 < ${#input_ref[@]})); then
+            ((index += 1))
+            value="${input_ref[index]}"
+            output_ref+=("$value")
+            query_ref+=(--profile "$value")
+          fi
+          ;;
+        --profile=*)
+          output_ref+=("$arg")
+          query_ref+=("$arg")
+          ;;
+        *)
+          output_ref+=("$arg")
+          ;;
+      esac
+    done
+    output_ref=("${output_ref[@]}")
+  }
+
+  read_codex_status_line() {
+    local request response reader_pid reader_stdout reader_stdin status_line=""
+    local read_ok=0
+
+    request="$(
+      jq -cn --arg cwd "$codex_working_dir" '{
+        method: "config/read",
+        id: 1,
+        params: {cwd: $cwd, includeLayers: true}
+      }'
+    )" || return 1
+
+    coproc CODEX_CONFIG_READER {
+      /usr/bin/env PATH="$codex_path" NPM_CONFIG_PREFIX="$npm_prefix" \
+        codex -c check_for_update_on_startup=false \
+        "${codex_status_query_flags[@]}" \
+        app-server --listen stdio:// 2>/dev/null
+    }
+    reader_pid="$CODEX_CONFIG_READER_PID"
+    exec {reader_stdout}<&"${CODEX_CONFIG_READER[0]}"
+    exec {reader_stdin}>&"${CODEX_CONFIG_READER[1]}"
+
+    if printf '%s\n' \
+      '{"method":"initialize","id":0,"params":{"clientInfo":{"name":"agent","title":"Agent","version":"1"},"capabilities":null}}' \
+      '{"method":"initialized","params":{}}' \
+      "$request" >&"$reader_stdin"; then
+      while IFS= read -r -t 10 response <&"$reader_stdout"; do
+        if jq -e '
+          .id == 1 and
+          (.result.config | type == "object") and
+          ((.result.config.tui | type) == "object" or
+            (.result.config.tui | type) == "null")
+        ' \
+          >/dev/null 2>&1 <<<"$response"; then
+          status_line="$(
+            jq -c '
+              .result as $result |
+              ((($result.layers // []) | any(
+                (.config.tui? | type == "object") and
+                (.config.tui | has("status_line"))
+              )) or (($result.origins // {}) | has("tui.status_line"))) as $explicit |
+              (if $explicit then
+                ($result.config.tui.status_line // [])
+              else
+                ["model-with-reasoning", "context-remaining", "current-dir"]
+              end) |
+              if type != "array" then [] else . end |
+              if index("thread-id") == null then . + ["thread-id"] else . end
+            ' <<<"$response"
+          )" || status_line=""
+          [[ -n "$status_line" ]] && read_ok=1
+          break
+        fi
+        if jq -e '.id == 1' >/dev/null 2>&1 <<<"$response"; then
+          break
+        fi
+      done
+    fi
+
+    exec {reader_stdin}>&-
+    exec {reader_stdout}<&-
+    kill "$reader_pid" 2>/dev/null || true
+    wait "$reader_pid" 2>/dev/null || true
+    [[ "$read_ok" -eq 1 ]] || return 1
+    printf '%s\n' "$status_line"
+  }
+
+  if codex_tui_invocation "${argv[@]}"; then
+    codex_status_query_flags=()
+    filtered_agent_codex_flags=()
+    filtered_codex_argv=()
+    filter_codex_config_args agent_codex_flags filtered_agent_codex_flags \
+      codex_status_query_flags
+    filter_codex_config_args argv filtered_codex_argv codex_status_query_flags
+    agent_codex_flags=("${filtered_agent_codex_flags[@]}")
+    argv=("${filtered_codex_argv[@]}")
+    if ! codex_status_line="$(read_codex_status_line)"; then
+      codex_status_line='["model-with-reasoning","context-remaining","current-dir","thread-id"]'
+      echo 'agent: could not read the Codex status-line configuration; using the default footer plus thread ID.' >&2
+    fi
+    codex_config_flags+=(-c "tui.status_line=$codex_status_line")
+  fi
+
+  # The launcher is used inside an already managed environment, so Codex
+  # sessions default to running without approval prompts. Apply that policy
+  # consistently to interactive starts, resumes, and non-interactive runs.
+  # Explicit command-line or AGENT_CODEX_FLAGS values always win.
+  has_sandbox=0
+  has_approval=0
+  for arg in "${agent_codex_flags[@]}" "${argv[@]}"; do
+    case "$arg" in
+      -s|--sandbox|--sandbox=*)
+        has_sandbox=1
+        ;;
+      -a|--ask-for-approval|--ask-for-approval=*)
+        has_approval=1
+        ;;
+      --approve-for-me|--dangerously-bypass-approvals-and-sandbox)
+        has_sandbox=1
+        has_approval=1
+        ;;
+    esac
+  done
+
+  codex_default_flags=()
+  if [[ "$has_sandbox" -eq 0 ]]; then
+    codex_default_flags+=("--sandbox" "$default_codex_sandbox")
+  fi
+  if [[ "$has_approval" -eq 0 ]]; then
+    codex_default_flags+=("--ask-for-approval" "$default_codex_approval")
+  fi
+
+  run_codex() {
+    exec /usr/bin/env PATH="$codex_path" NPM_CONFIG_PREFIX="$npm_prefix" \
+      codex "${agent_model_flags[@]}" "${codex_default_flags[@]}" "${agent_codex_flags[@]}" "$@"
+  }
+
+  model_default_flags "${agent_codex_flags[@]}" "${argv[@]}"
+  if [[ ${#argv[@]} -gt 0 ]]; then
+    run_codex "${codex_config_flags[@]}" "${argv[@]}"
+  fi
+  run_codex "${codex_config_flags[@]}"
+fi
+
+if [[ "$agent_bin" == "claude" ]]; then
+  # Claude keys folder trust to the project path in its configuration file
+  # and shows the trust dialog when the entry is absent. Projects under the
+  # shared source root are the lab's own code, so accept them ahead of
+  # launch, as the Codex path does. The home directory never qualifies:
+  # Claude refuses to save trust there, so a launch from $HOME still asks.
+  claude_trust_root="${AGENT_CLAUDE_AUTO_TRUST_ROOT-/srv/src}"
+  claude_config_file="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+  if [[ -n "$claude_trust_root" && -d "$claude_trust_root" &&
+        -f "$claude_config_file" ]]; then
+    claude_trust_root="$(cd "$claude_trust_root" && pwd -P)"
+    if claude_project_root="$(git -C "$launch_dir" rev-parse --show-toplevel 2>/dev/null)"; then
+      claude_project_root="$(cd "$claude_project_root" && pwd -P)"
+    else
+      claude_project_root="$launch_dir"
+    fi
+    if [[ "$claude_project_root" != "$HOME" &&
+          ( "$claude_project_root" == "$claude_trust_root" ||
+            "$claude_project_root" == "$claude_trust_root/"* ) ]] &&
+      ! jq -e --arg dir "$claude_project_root" \
+        '.projects[$dir].hasTrustDialogAccepted == true' \
+        "$claude_config_file" >/dev/null 2>&1; then
+      if claude_config_updated="$(
+        jq --arg dir "$claude_project_root" \
+          '.projects[$dir] = ((.projects[$dir] // {}) +
+            {hasTrustDialogAccepted: true})' \
+          "$claude_config_file" 2>/dev/null
+      )" && [[ -n "$claude_config_updated" ]] &&
+        claude_config_temp="$(mktemp "$claude_config_file.XXXXXX")" &&
+        printf '%s\n' "$claude_config_updated" > "$claude_config_temp" &&
+        mv -f -- "$claude_config_temp" "$claude_config_file"; then
+        :
+      else
+        echo "agent: could not persist Claude trust for $claude_project_root" >&2
+      fi
+    fi
+  fi
+
+  claude_session_flags=()
+  if [[ -n "$agent_claude_session_id" ]]; then
+    claude_session_flags=(--session-id "$agent_claude_session_id")
+  fi
+  claude_flags=()
+  if [[ -n "${AGENT_CLAUDE_FLAGS:-}" ]]; then
+    read -r -a claude_flags <<<"$AGENT_CLAUDE_FLAGS"
+  fi
+  claude_argv=("$@")
+  claude_name_flags=()
+  strip_claude_name_flags() {
+    local input_name="$1" output_name="$2"
+    local arg index after_delimiter=0
+    local -n input_ref="$input_name" output_ref="$output_name"
+
+    output_ref=()
+    for ((index = 0; index < ${#input_ref[@]}; index++)); do
+      arg="${input_ref[index]}"
+      if [[ "$after_delimiter" -eq 1 ]]; then
+        output_ref+=("$arg")
+        continue
+      fi
+      case "$arg" in
+        --)
+          after_delimiter=1
+          output_ref+=("$arg")
+          ;;
+        --name=*|-n=*)
+          ;;
+        -n|--name)
+          if ((index + 1 < ${#input_ref[@]})); then
+            ((index += 1))
+          fi
+          ;;
+        *)
+          output_ref+=("$arg")
+          ;;
+      esac
+    done
+  }
+  if [[ -n "$agent_claude_display_name" ]]; then
+    filtered_claude_flags=()
+    filtered_claude_argv=()
+    strip_claude_name_flags claude_flags filtered_claude_flags
+    strip_claude_name_flags claude_argv filtered_claude_argv
+    claude_flags=("${filtered_claude_flags[@]}")
+    claude_argv=("${filtered_claude_argv[@]}")
+    claude_name_flags=(--name "$agent_claude_display_name")
+  fi
+  # Claude has one permission-policy selector. Default to its no-prompt
+  # policy, but let an explicit CLI or AGENT_CLAUDE_FLAGS policy replace it.
+  has_claude_permission_policy=0
+  for arg in "${claude_flags[@]}" "${claude_argv[@]}"; do
+    case "$arg" in
+      --dangerously-skip-permissions|--permission-mode|--permission-mode=*)
+        has_claude_permission_policy=1
+        ;;
+    esac
+  done
+  claude_default_flags=()
+  if [[ "$has_claude_permission_policy" -eq 0 ]]; then
+    claude_default_flags=(--dangerously-skip-permissions)
+  fi
+  claude_instructions="$agent_instructions"
+  model_default_flags "${claude_flags[@]}" "${claude_argv[@]}"
+  if [[ -n "$claude_instructions" ]]; then
+    exec claude "${agent_model_flags[@]}" "${claude_default_flags[@]}" "${claude_flags[@]}" \
+      "${claude_session_flags[@]}" "${claude_name_flags[@]}" \
+      "${claude_argv[@]}" \
+      --append-system-prompt "$claude_instructions"
+  fi
+  exec claude "${agent_model_flags[@]}" "${claude_default_flags[@]}" "${claude_flags[@]}" \
+    "${claude_session_flags[@]}" "${claude_name_flags[@]}" \
+    "${claude_argv[@]}"
+fi
+
+if [[ "$agent_bin" == "pi" ]]; then
+  pi_provider="${AGENT_PI_PROVIDER:-local}"
+  pi_flags=()
+  if [[ -n "${AGENT_PI_FLAGS:-}" ]]; then
+    read -r -a pi_flags <<<"$AGENT_PI_FLAGS"
+  fi
+  pi_display_flags=()
+  if pi_persistent_interactive_invocation "${pi_flags[@]}" "$@"; then
+    pi_session_id_extension="$agent_share_dir/pi/session-id-name.ts"
+    if [[ ! -r "$pi_session_id_extension" ]]; then
+      echo "agent pi: session-ID extension is unavailable: $pi_session_id_extension" >&2
+      exit 2
+    fi
+    pi_display_flags=(--extension "$pi_session_id_extension")
+  fi
+
+  resolve_pi_model() {
+    local pattern="$1"
+    local base_pattern="$pattern"
+    local configuration_key=""
+    local configuration_resolver=""
+    local thinking_suffix=""
+    local model_table
+    local -a matches
+
+    if [[ "$pattern" == */* ]]; then
+      printf '%s\n' "$pattern"
+      return 0
+    fi
+
+    if [[ "$pattern" =~ ^(.+):(off|minimal|low|medium|high|xhigh)$ ]]; then
+      base_pattern="${BASH_REMATCH[1]}"
+      thinking_suffix=":${BASH_REMATCH[2]}"
+    fi
+
+    if [[ "$base_pattern" == @* ]]; then
+      configuration_key="${base_pattern#@}"
+      if [[ -z "$configuration_key" ||
+            ! "$configuration_key" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        echo "agent pi: invalid configuration key '$configuration_key'." >&2
+        return 2
+      fi
+
+      configuration_resolver="${AGENT_PI_CONFIG_RESOLVER:-local-ai-bench}"
+      if ! command -v "$configuration_resolver" >/dev/null 2>&1; then
+        echo "agent pi: configuration resolver not found: $configuration_resolver" >&2
+        return 2
+      fi
+      if ! base_pattern="$(
+        "$configuration_resolver" --pi-model "$configuration_key"
+      )"; then
+        echo "agent pi: could not resolve configuration '@$configuration_key'." >&2
+        return 2
+      fi
+      if [[ -z "$base_pattern" || "$base_pattern" == *$'\n'* ]]; then
+        echo "agent pi: invalid model returned for '@$configuration_key'." >&2
+        return 2
+      fi
+    fi
+
+    model_table="$(pi --list-models "$pi_provider" 2>&1)" || return 1
+    mapfile -t matches < <(
+      awk -v provider="$pi_provider" -v pattern="$base_pattern" '
+        NR > 1 && $1 == provider && $2 == pattern {
+          print $1 "/" $2
+        }
+      ' <<<"$model_table"
+    )
+
+    if [[ ${#matches[@]} -eq 0 ]]; then
+      mapfile -t matches < <(
+        awk -v provider="$pi_provider" -v pattern="$base_pattern" '
+          NR > 1 && $1 == provider &&
+            index(tolower($2), tolower(pattern)) != 0 {
+            print $1 "/" $2
+          }
+        ' <<<"$model_table"
+      )
+    fi
+
+    case "${#matches[@]}" in
+      0)
+        echo "agent pi: no model matches '$base_pattern' in provider '$pi_provider'." >&2
+        return 2
+        ;;
+      1)
+        printf '%s%s\n' "${matches[0]}" "$thinking_suffix"
+        ;;
+      *)
+        echo "agent pi: model pattern '$base_pattern' is ambiguous:" >&2
+        for pi_match in "${matches[@]}"; do
+          printf '  %s\n' "${pi_match#*/}" >&2
+        done
+        return 2
+        ;;
+    esac
+  }
+
+  pi_argv=()
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "-m" ]]; then
+      if [[ $# -lt 2 ]]; then
+        echo "agent pi: -m requires a model name or pattern." >&2
+        exit 2
+      fi
+      pi_model="$(resolve_pi_model "$2")" || exit $?
+      pi_argv+=("--model" "$pi_model")
+      shift 2
+      continue
+    fi
+    pi_argv+=("$1")
+    shift
+  done
+
+  model_default_flags "${pi_flags[@]}" "${pi_argv[@]}"
+  if [[ -n "$agent_instructions" ]]; then
+    exec pi "${agent_model_flags[@]}" "${pi_flags[@]}" "${pi_display_flags[@]}" \
+      --no-context-files \
+      --append-system-prompt "$agent_instructions" \
+      "${pi_argv[@]}"
+  fi
+  exec pi "${agent_model_flags[@]}" "${pi_flags[@]}" "${pi_display_flags[@]}" \
+    --no-context-files "${pi_argv[@]}"
+fi
+
+echo "Unsupported AGENT_BIN '$agent_bin' (expected 'codex', 'claude', or 'pi')." >&2
+exit 1

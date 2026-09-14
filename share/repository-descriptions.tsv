@@ -1,0 +1,4 @@
+# Optional fallback descriptions for repositories without their own metadata.
+# Each entry is a repository name, a tab, and a short description.
+# Prefer a tracked .repo-description or a literal flake.nix description.
+# Set LAB_REPO_CATALOG to use a separate local catalog.

@@ -1,0 +1,134 @@
+{
+  "nodes": {
+    "content2title": {
+      "inputs": {
+        "md2man": [
+          "md2man"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788050112,
+        "narHash": "sha256-p7U5hFbYkWkPy0A7VkMDFqMF2oDN/qAK5TcQrrPFCpk=",
+        "ref": "main",
+        "rev": "6a08be12a22723d732373e6e8b9a4545564b9a2b",
+        "revCount": 2,
+        "type": "git",
+        "url": "ssh://git@forge/srv/git/content2title.git"
+      },
+      "original": {
+        "ref": "main",
+        "type": "git",
+        "url": "ssh://git@forge/srv/git/content2title.git"
+      }
+    },
+    "md2man": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1787265590,
+        "narHash": "sha256-vKynyVJ2TdCnRBo+Jt5ax8T14D/bGqw0dhjb6ck28Yo=",
+        "ref": "main",
+        "rev": "a89992e0c97848074452efd6938a134040304598",
+        "revCount": 5,
+        "type": "git",
+        "url": "ssh://git@forge/srv/git/md2man.git"
+      },
+      "original": {
+        "ref": "main",
+        "type": "git",
+        "url": "ssh://git@forge/srv/git/md2man.git"
+      }
+    },
+    "microvm": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "spectrum": "spectrum"
+      },
+      "locked": {
+        "lastModified": 1787834973,
+        "narHash": "sha256-bY2y5jQ17MQxt1N/jc8luDB98Pyf+FRY2igGWeXnS28=",
+        "owner": "microvm-nix",
+        "repo": "microvm.nix",
+        "rev": "ea57aebfb6016d9f091af7576a97dcf1aaa71fa1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "microvm-nix",
+        "repo": "microvm.nix",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1787414105,
+        "narHash": "sha256-WncT27+3BOkgTaJZLnCsf3LcYf9RXMuR9ONSN4rzQ7s=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "a9e6d84f9c2f9012f5fe7d964a7851352300e61a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "rm4agent": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1787599056,
+        "narHash": "sha256-HsMuZ/rxfMwPnDALKGioZR01fXXoZo9gogB20Rn+gyA=",
+        "ref": "main",
+        "rev": "a2c48baeb6b467b0821897ec1327085e523b4400",
+        "revCount": 3,
+        "type": "git",
+        "url": "ssh://git@forge/srv/git/rm4agent.git"
+      },
+      "original": {
+        "ref": "main",
+        "type": "git",
+        "url": "ssh://git@forge/srv/git/rm4agent.git"
+      }
+    },
+    "root": {
+      "inputs": {
+        "content2title": "content2title",
+        "md2man": "md2man",
+        "microvm": "microvm",
+        "nixpkgs": "nixpkgs",
+        "rm4agent": "rm4agent"
+      }
+    },
+    "spectrum": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785761586,
+        "narHash": "sha256-MWOMVqJJERwjQGgRIv8d6rlEBqbLM3VZWxHkNKIIZNw=",
+        "ref": "refs/heads/main",
+        "rev": "a7762d6f54b40560dd5255ce902e6e6a5d980fe9",
+        "revCount": 1416,
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

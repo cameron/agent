@@ -1,0 +1,607 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+program=agent-process-collect
+data_root=${AGENT_PROCESS_COLLECT_ROOT:-/var/log/agent-process-collect}
+retention_days=${AGENT_PROCESS_COLLECT_RETENTION_DAYS:-30}
+reference_time=${AGENT_PROCESS_COLLECT_NOW:-now}
+pacct_dir=$data_root/pacct
+pacct_archive=$pacct_dir/archive
+pacct_current=$pacct_dir/current
+audit_dir=$data_root/audit
+audit_archive=$audit_dir/archive
+audit_current=$audit_dir/current
+index_dir=$data_root/index
+index_archive=$index_dir/archive
+index_database=${AGENT_PROCESS_COLLECT_INDEX_DATABASE:-$index_dir/process.sqlite3}
+rotate_lock=$data_root/rotate.lock
+
+accton_command=${AGENT_PROCESS_COLLECT_ACCTON:-accton}
+lastcomm_command=${AGENT_PROCESS_COLLECT_LASTCOMM:-lastcomm}
+sa_command=${AGENT_PROCESS_COLLECT_SA:-sa}
+auditctl_command=${AGENT_PROCESS_COLLECT_AUDITCTL:-auditctl}
+ausearch_command=${AGENT_PROCESS_COLLECT_AUSEARCH:-ausearch}
+getcap_command=${AGENT_PROCESS_COLLECT_GETCAP:-getcap}
+systemctl_command=${AGENT_PROCESS_COLLECT_SYSTEMCTL:-systemctl}
+timeout_command=${AGENT_PROCESS_COLLECT_TIMEOUT:-timeout}
+indexer=${AGENT_PROCESS_COLLECT_INDEXER:-agent-process-index}
+rm4agent_command=${AGENT_PROCESS_COLLECT_RM4AGENT:-rm4agent}
+labeler=${AGENT_PROCESS_LABELER:-/run/wrappers/bin/agent-process-label}
+report_timeout_seconds=${AGENT_PROCESS_COLLECT_REPORT_TIMEOUT_SECONDS:-60}
+
+temporary_paths=()
+
+usage() {
+  cat <<'EOF'
+Usage:
+  agent-process-collect status
+  agent-process-collect report [--days N]
+  agent-process-collect sessions [--since TIME] [--until TIME] [--json]
+  agent-process-collect lastcomm [--days N] [-- LASTCOMM-OPTION ...]
+  agent-process-collect sa [--days N] [-- SA-OPTION ...]
+  agent-process-collect execs [--days N] [-- AUSEARCH-OPTION ...]
+
+Internal service operations:
+  agent-process-collect acct-start
+  agent-process-collect acct-stop
+  agent-process-collect index-bootstrap
+  agent-process-collect rotate
+EOF
+}
+
+fail() {
+  printf '%s: %s\n' "$program" "$*" >&2
+  exit 1
+}
+
+usage_error() {
+  printf '%s: %s\n' "$program" "$*" >&2
+  printf "Try '%s --help' for more information.\n" "$program" >&2
+  exit 2
+}
+
+cleanup() {
+  local path
+  for path in "${temporary_paths[@]}"; do
+    if [[ -e $path || -L $path ]]; then
+      "$rm4agent_command" "$path" >/dev/null 2>&1 || true
+    fi
+  done
+}
+trap cleanup EXIT
+
+require_root() {
+  if [[ ${AGENT_PROCESS_COLLECT_ALLOW_NON_ROOT:-0} != 1 && $EUID -ne 0 ]]; then
+    fail 'must run as root'
+  fi
+}
+
+set_root_ownership() {
+  if [[ ${AGENT_PROCESS_COLLECT_ALLOW_NON_ROOT:-0} != 1 ]]; then
+    chown root:root "$@"
+  fi
+}
+
+validate_configuration() {
+  [[ $retention_days =~ ^[1-9][0-9]*$ ]] ||
+    fail 'retention days must be a positive integer'
+  [[ $report_timeout_seconds =~ ^[1-9][0-9]*$ ]] ||
+    fail 'report timeout must be a positive integer'
+}
+
+ensure_layout() {
+  install -d -m 0700 \
+    "$pacct_dir" "$pacct_archive" \
+    "$audit_dir" "$audit_archive" \
+    "$index_dir" "$index_archive"
+  install -d -m 0700 "$(dirname "$rotate_lock")"
+}
+
+new_temporary_file() {
+  local template=${1:-${TMPDIR:-/tmp}/agent-process-collect.XXXXXX}
+  created_temporary_file=$(mktemp "$template")
+  chmod 0600 "$created_temporary_file"
+  temporary_paths+=("$created_temporary_file")
+}
+
+validate_days() {
+  local days=$1
+  [[ $days =~ ^[1-9][0-9]*$ ]] ||
+    usage_error '--days must be a positive integer'
+  ((days <= retention_days)) ||
+    usage_error "--days must not exceed $retention_days"
+}
+
+parse_days() {
+  selected_days=$retention_days
+  remaining_arguments=()
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --days)
+        [[ $# -ge 2 ]] || usage_error '--days requires a value'
+        selected_days=$2
+        shift 2
+        ;;
+      --days=*)
+        selected_days=${1#--days=}
+        shift
+        ;;
+      --)
+        shift
+        remaining_arguments+=("$@")
+        break
+        ;;
+      *)
+        remaining_arguments+=("$1")
+        shift
+        ;;
+    esac
+  done
+  validate_days "$selected_days"
+}
+
+list_audit_files() {
+  local days=$1
+  {
+    find "$audit_archive" -maxdepth 1 -type f -name '*.log' -mtime "-$days" \
+      -printf '%T@ %p\n' 2>/dev/null
+    find "$audit_dir" -maxdepth 1 -type f -name 'current.[0-9]*' \
+      -mtime "-$days" -printf '%T@ %p\n' 2>/dev/null
+    if [[ -r $audit_current ]]; then
+      stat -c '%Y %n' "$audit_current"
+    fi
+  } | sort -n | cut -d' ' -f2-
+}
+
+list_pacct_files() {
+  local days=$1
+  local order=${2:-ascending}
+  if [[ $order == descending && -r $pacct_current ]]; then
+    printf '%s\n' "$pacct_current"
+  fi
+  find "$pacct_archive" -maxdepth 1 -type f -name '*.pacct' \
+    -mtime "-$days" -printf '%T@ %p\n' 2>/dev/null |
+    if [[ $order == descending ]]; then
+      sort -nr
+    else
+      sort -n
+    fi | cut -d' ' -f2-
+  if [[ $order != descending && -r $pacct_current ]]; then
+    printf '%s\n' "$pacct_current"
+  fi
+}
+
+archive_name() {
+  local directory=$1
+  local extension=$2
+  local timestamp host boot_id candidate sequence
+  timestamp=$(date -u '+%Y%m%dT%H%M%S.%NZ')
+  host=$(hostname)
+  host=${host//[^A-Za-z0-9_.-]/_}
+  if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    read -r boot_id </proc/sys/kernel/random/boot_id
+  else
+    boot_id=unknown
+  fi
+  candidate=$directory/$host-$boot_id-$timestamp.$extension
+  sequence=0
+  while [[ -e $candidate ]]; do
+    ((sequence += 1))
+    candidate=$directory/$host-$boot_id-$timestamp-$sequence.$extension
+  done
+  printf '%s\n' "$candidate"
+}
+
+acct_start() {
+  require_root
+  ensure_layout
+  if [[ -L $pacct_current || ( -e $pacct_current && ! -f $pacct_current ) ]]; then
+    fail "$pacct_current must be a regular file"
+  fi
+  if [[ ! -e $pacct_current ]]; then
+    umask 077
+    : >"$pacct_current"
+  fi
+  set_root_ownership "$pacct_current"
+  chmod 0600 "$pacct_current"
+  "$accton_command" "$pacct_current"
+}
+
+acct_stop() {
+  require_root
+  "$accton_command" off
+}
+
+index_bootstrap() {
+  local archived_invalid path timestamp
+  local -a audit_files=() newly_rotated_files=()
+  local -A indexed_audit_files=()
+  require_root
+  ensure_layout
+  if "$indexer" validate --database "$index_database" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  timestamp=$(date -u '+%Y%m%dT%H%M%S.%NZ')
+  if [[ -e $index_database || -L $index_database ]]; then
+    archived_invalid=$index_archive/process.sqlite3.invalid-$timestamp
+    mv -- "$index_database" "$archived_invalid"
+  fi
+  for sidecar in "$index_database-wal" "$index_database-shm"; do
+    if [[ -e $sidecar || -L $sidecar ]]; then
+      mv -- "$sidecar" "$index_archive/$(basename "$sidecar").invalid-$timestamp"
+    fi
+  done
+
+  new_temporary_file "$index_dir/.process.sqlite3.XXXXXX"
+  mapfile -t audit_files < <(list_audit_files "$retention_days")
+  for path in "${audit_files[@]}"; do
+    indexed_audit_files["$path"]=1
+  done
+  "$indexer" build --database "$created_temporary_file" \
+    --now "$reference_time" "${audit_files[@]}"
+
+  mapfile -t audit_files < <(list_audit_files "$retention_days")
+  for path in "${audit_files[@]}"; do
+    if [[ -z ${indexed_audit_files["$path"]+present} ]]; then
+      newly_rotated_files+=("$path")
+    fi
+  done
+  if ((${#newly_rotated_files[@]} > 0)); then
+    "$indexer" build --database "$created_temporary_file" \
+      --now "$reference_time" "${newly_rotated_files[@]}"
+  fi
+  set_root_ownership "$created_temporary_file"
+  chmod 0600 "$created_temporary_file"
+  mv -- "$created_temporary_file" "$index_database"
+}
+
+rotate_pacct() {
+  local archived replacement failed_replacement
+  if [[ ! -f $pacct_current || -L $pacct_current ]]; then
+    printf '%s: process accounting file is unavailable: %s\n' \
+      "$program" "$pacct_current" >&2
+    return 1
+  fi
+  archived=$(archive_name "$pacct_archive" pacct)
+  mv -- "$pacct_current" "$archived"
+  umask 077
+  : >"$pacct_current"
+  set_root_ownership "$pacct_current"
+  chmod 0600 "$pacct_current"
+  if ! "$accton_command" "$pacct_current"; then
+    failed_replacement=$(archive_name "$pacct_archive" failed-pacct)
+    mv -- "$pacct_current" "$failed_replacement"
+    mv -- "$archived" "$pacct_current"
+    printf '%s: could not switch process accounting to the new file\n' \
+      "$program" >&2
+    return 1
+  fi
+}
+
+rotate_audit() {
+  local old_inode new_inode attempt source archived
+  if [[ ! -f $audit_current || -L $audit_current ]]; then
+    printf '%s: Audit file is unavailable: %s\n' \
+      "$program" "$audit_current" >&2
+    return 1
+  fi
+  old_inode=$(stat -c '%i' "$audit_current")
+  "$auditctl_command" --signal rotate
+  new_inode=$old_inode
+  for attempt in {1..100}; do
+    if [[ -f $audit_current ]]; then
+      new_inode=$(stat -c '%i' "$audit_current")
+      [[ $new_inode != "$old_inode" ]] && break
+    fi
+    sleep 0.05
+  done
+  if [[ $new_inode == "$old_inode" ]]; then
+    printf '%s: Audit did not replace its current log after rotation\n' \
+      "$program" >&2
+    return 1
+  fi
+  while IFS= read -r source; do
+    [[ -f $source ]] || continue
+    archived=$(archive_name "$audit_archive" log)
+    mv -- "$source" "$archived"
+  done < <(
+    find "$audit_dir" -maxdepth 1 -type f -name 'current.[0-9]*' \
+      -printf '%T@ %p\n' | sort -n | sed 's/^[^ ]* //'
+  )
+}
+
+prune_archives() {
+  local failed=0 path
+  while IFS= read -r -d '' path; do
+    "$rm4agent_command" "$path" || failed=1
+  done < <(
+    find "$pacct_archive" "$audit_archive" -maxdepth 1 -type f \
+      -mtime "+$((retention_days - 1))" -print0
+  )
+  return "$failed"
+}
+
+rotate_all() {
+  local failed=0
+  require_root
+  ensure_layout
+  exec 9>"$rotate_lock"
+  flock 9
+  rotate_pacct || failed=1
+  rotate_audit || failed=1
+  prune_archives || failed=1
+  if [[ -f $index_database ]]; then
+    "$indexer" prune --database "$index_database" \
+      --days "$retention_days" --now "$reference_time" || failed=1
+  else
+    printf '%s: compact process index is unavailable\n' "$program" >&2
+    failed=1
+  fi
+  return "$failed"
+}
+
+collection_health() {
+  local audit_status lost rules capabilities
+  audit_status=$($auditctl_command -s 2>/dev/null) || audit_status=
+  lost=$(awk '$1 == "lost" { print $2 }' <<<"$audit_status")
+  lost=${lost:-unknown}
+  rules=$($auditctl_command -l 2>/dev/null) || rules=
+  capabilities=$($getcap_command "$labeler" 2>/dev/null) || capabilities=
+  collection_lost=$lost
+  if [[ ! $lost =~ ^[0-9]+$ || $lost -ne 0 ||
+        $rules != *agent_exec* || ! -x $labeler ||
+        $capabilities != *cap_audit_control* ||
+        $capabilities != *cap_audit_write* ]]; then
+    return 1
+  fi
+}
+
+status_command() {
+  local failed=0 lost size oldest metadata index_output index_status
+  local expected_metadata=600:0:0
+  require_root
+  if [[ ${AGENT_PROCESS_COLLECT_ALLOW_NON_ROOT:-0} == 1 ]]; then
+    expected_metadata="600:$EUID:$(id -g)"
+  fi
+  if "$systemctl_command" is-active --quiet agent-process-accounting.service; then
+    printf 'process-accounting: active\n'
+  else
+    printf 'process-accounting: inactive\n'
+    failed=1
+  fi
+  if "$systemctl_command" is-active --quiet auditd.service; then
+    printf 'auditd: active\n'
+  else
+    printf 'auditd: inactive\n'
+    failed=1
+  fi
+  if [[ -f $pacct_current && ! -L $pacct_current ]]; then
+    size=$(stat -c '%s' "$pacct_current")
+    printf 'pacct-current-bytes: %s\n' "$size"
+    metadata=$(stat -c '%a:%u:%g' "$pacct_current")
+    if [[ $metadata != "$expected_metadata" ]]; then
+      printf 'pacct-current-access: unsafe (%s)\n' "$metadata"
+      failed=1
+    fi
+  else
+    printf 'pacct-current: missing\n'
+    failed=1
+  fi
+  if [[ -f $audit_current && ! -L $audit_current ]]; then
+    size=$(stat -c '%s' "$audit_current")
+    printf 'audit-current-bytes: %s\n' "$size"
+    metadata=$(stat -c '%a:%u:%g' "$audit_current")
+    if [[ $metadata != "$expected_metadata" ]]; then
+      printf 'audit-current-access: unsafe (%s)\n' "$metadata"
+      failed=1
+    fi
+  else
+    printf 'audit-current: missing\n'
+    failed=1
+  fi
+
+  if collection_health; then
+    lost=$collection_lost
+  else
+    lost=$collection_lost
+    failed=1
+  fi
+  printf 'audit-lost-events: %s\n' "$lost"
+  if $auditctl_command -l 2>/dev/null | grep -Fq 'agent_exec'; then
+    printf 'agent-exec-rules: loaded\n'
+  else
+    printf 'agent-exec-rules: missing\n'
+  fi
+  if [[ -x $labeler ]] &&
+      $getcap_command "$labeler" 2>/dev/null | grep -q 'cap_audit_.*write'; then
+    printf 'agent-labeler: ready\n'
+  else
+    printf 'agent-labeler: unavailable or missing capabilities\n'
+  fi
+
+  set +e
+  index_output=$("$indexer" status --database "$index_database" \
+    --now "$reference_time" 2>&1)
+  index_status=$?
+  set -e
+  printf '%s\n' "$index_output"
+  [[ $index_status -eq 0 ]] || failed=1
+
+  oldest=$(
+    find "$pacct_archive" "$audit_archive" -maxdepth 1 -type f \
+      -printf '%T@ %TY-%Tm-%TdT%TH:%TM:%TSZ %p\n' 2>/dev/null |
+      sort -n | head -n 1 | cut -d' ' -f2- || true
+  )
+  printf 'oldest-archive: %s\n' "${oldest:-none}"
+  return "$failed"
+}
+
+report_command() {
+  local health=healthy index_health index_output index_status
+  parse_days "$@"
+  [[ ${#remaining_arguments[@]} -eq 0 ]] ||
+    usage_error 'report accepts only --days N'
+  require_root
+  if ! collection_health; then
+    health=needs-attention
+  fi
+  if ! "$indexer" status --database "$index_database" \
+      --now "$reference_time" >/dev/null 2>&1; then
+    health=needs-attention
+  fi
+
+  set +e
+  index_output=$("$timeout_command" --signal=TERM --kill-after=5s \
+    "${report_timeout_seconds}s" "$indexer" report \
+    --database "$index_database" --days "$selected_days" \
+    --now "$reference_time" 2>&1)
+  index_status=$?
+  set -e
+  if [[ $index_status -eq 124 || $index_status -eq 137 ]]; then
+    health=needs-attention
+    index_output="- Report error: compact index query timed out after ${report_timeout_seconds} seconds"
+  elif [[ $index_status -ne 0 ]]; then
+    health=needs-attention
+    index_output='- Report error: compact index is unavailable'
+  fi
+  printf '%s\n' \
+    "- Collection health: $health" \
+    "- Audit events lost: $collection_lost" \
+    "$index_output"
+  [[ $health == healthy ]]
+}
+
+sessions_command() {
+  require_root
+  "$indexer" sessions --database "$index_database" "$@"
+}
+
+lastcomm_view() {
+  local argument file
+  local -a files
+  parse_days "$@"
+  for argument in "${remaining_arguments[@]}"; do
+    case $argument in
+      -f|--file|--file=*|-f?*|-[^-]*f*)
+        usage_error 'lastcomm input-file options are managed by this command'
+        ;;
+    esac
+  done
+  require_root
+  mapfile -t files < <(list_pacct_files "$selected_days" descending)
+  for file in "${files[@]}"; do
+    "$lastcomm_command" --pid --file "$file" "${remaining_arguments[@]}"
+  done
+}
+
+sa_view() {
+  local argument
+  local -a files pipeline_status
+  parse_days "$@"
+  for argument in "${remaining_arguments[@]}"; do
+    case $argument in
+      -s|-[^-]*s*|--merge|--other-acct-file|--other-acct-file=*|\
+        --other-savacct-file|--other-savacct-file=*|\
+        --other-usracct-file|--other-usracct-file=*)
+        usage_error 'sa input and summary-file options are managed by this command'
+        ;;
+      -*) ;;
+      *) usage_error 'sa does not accept a caller-selected accounting file' ;;
+    esac
+  done
+  require_root
+  mapfile -t files < <(list_pacct_files "$selected_days")
+  set +e
+  cat -- "${files[@]}" |
+    "$sa_command" -i --other-acct-file /dev/stdin "${remaining_arguments[@]}"
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -e
+  [[ ${pipeline_status[0]} -eq 0 && ${pipeline_status[1]} -eq 0 ]]
+}
+
+execs_view() {
+  local argument file command_status failed=0
+  local -a files
+  parse_days "$@"
+  for argument in "${remaining_arguments[@]}"; do
+    case $argument in
+      -if|-if?*|--input|--input=*|--input-logs|-k|-k?*|--key|--key=*)
+        usage_error 'ausearch input and key options are managed by this command'
+        ;;
+    esac
+  done
+  require_root
+  mapfile -t files < <(list_audit_files "$selected_days")
+  for file in "${files[@]}"; do
+    set +e
+    "$ausearch_command" --input "$file" --key agent_exec \
+      "${remaining_arguments[@]}"
+    command_status=$?
+    set -e
+    if [[ $command_status -ne 0 && $command_status -ne 1 ]]; then
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+validate_configuration
+case ${1:-} in
+  -h|--help)
+    usage
+    ;;
+  status)
+    shift
+    [[ $# -eq 0 ]] || usage_error 'status accepts no arguments'
+    status_command
+    ;;
+  report)
+    shift
+    report_command "$@"
+    ;;
+  sessions)
+    shift
+    sessions_command "$@"
+    ;;
+  lastcomm)
+    shift
+    lastcomm_view "$@"
+    ;;
+  sa)
+    shift
+    sa_view "$@"
+    ;;
+  execs)
+    shift
+    execs_view "$@"
+    ;;
+  acct-start)
+    shift
+    [[ $# -eq 0 ]] || usage_error 'acct-start accepts no arguments'
+    acct_start
+    ;;
+  acct-stop)
+    shift
+    [[ $# -eq 0 ]] || usage_error 'acct-stop accepts no arguments'
+    acct_stop
+    ;;
+  index-bootstrap)
+    shift
+    [[ $# -eq 0 ]] || usage_error 'index-bootstrap accepts no arguments'
+    index_bootstrap
+    ;;
+  rotate)
+    shift
+    [[ $# -eq 0 ]] || usage_error 'rotate accepts no arguments'
+    rotate_all
+    ;;
+  '')
+    usage >&2
+    exit 2
+    ;;
+  *)
+    usage_error "unknown command: $1"
+    ;;
+esac

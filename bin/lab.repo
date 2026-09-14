@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: lab.repo [--check] [QUERY...]
+
+List direct Git repositories below /srv/src. Optional query text filters the
+repository name and description. --check fails if any repository needs a
+description.
+EOF
+}
+
+check=0
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  --check)
+    check=1
+    shift
+    ;;
+  --)
+    shift
+    ;;
+  -*)
+    printf 'lab.repo: unknown option: %s\n' "$1" >&2
+    exit 2
+    ;;
+esac
+
+root="${LAB_REPO_ROOT:-/srv/src}"
+[[ -d "$root" ]] || {
+  printf 'lab.repo: source root does not exist: %s\n' "$root" >&2
+  exit 1
+}
+
+query="$*"
+query="${query,,}"
+query="${query#"${query%%[![:space:]]*}"}"
+query="${query%"${query##*[![:space:]]}"}"
+read -r -a query_tokens <<<"$query"
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+catalog="${LAB_REPO_CATALOG:-$script_dir/../share/repository-descriptions.tsv}"
+flake_description_re='^[[:space:]]*description[[:space:]]*=[[:space:]]*"([^"]*)";'
+missing=()
+
+catalog_description() {
+  local wanted="$1"
+  local catalog_name catalog_value
+
+  [[ -r "$catalog" ]] || return 1
+  while IFS=$'\t' read -r catalog_name catalog_value; do
+    [[ -n "$catalog_name" && "${catalog_name:0:1}" != '#' ]] || continue
+    if [[ "$catalog_name" == "$wanted" && -n "$catalog_value" ]]; then
+      printf '%s\n' "$catalog_value"
+      return 0
+    fi
+  done <"$catalog"
+  return 1
+}
+
+flake_description() {
+  local flake="$1"
+  local line
+
+  [[ -r "$flake" ]] || return 1
+  while IFS= read -r line; do
+    if [[ "$line" =~ $flake_description_re && -n "${BASH_REMATCH[1]}" ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done <"$flake"
+  return 1
+}
+
+listed=0
+printf 'REPOSITORY\tDESCRIPTION\n'
+for repository in "$root"/*; do
+  [[ -d "$repository" && -e "$repository/.git" ]] || continue
+  name="$(basename "$repository")"
+  description=
+  if [[ -r "$repository/.repo-description" ]]; then
+    IFS= read -r description <"$repository/.repo-description" || true
+  fi
+  if [[ -z "$description" ]]; then
+    description="$(flake_description "$repository/flake.nix" || true)"
+  fi
+  if [[ -z "$description" ]]; then
+    description="$(catalog_description "$name" || true)"
+  fi
+  if [[ -z "$description" ]]; then
+    missing+=("$name")
+    description='[description needed]'
+  fi
+  description="${description//$'\t'/ }"
+  description="${description//$'\r'/}"
+  haystack="${name,,} ${description,,}"
+  matched=1
+  for token in "${query_tokens[@]}"; do
+    if [[ "$haystack" != *"$token"* ]]; then
+      matched=0
+      break
+    fi
+  done
+  [[ "$matched" -eq 1 ]] || continue
+  printf '%s\t%s\n' "$name" "$description"
+  listed=$((listed + 1))
+done
+
+if [[ -n "$query" && "$listed" -eq 0 ]]; then
+  printf 'lab.repo: no repository matched: %s\n' "$query" >&2
+fi
+
+if ((${#missing[@]} > 0)); then
+  printf 'lab.repo: description needed for: %s\n' "${missing[*]}" >&2
+  ((check == 0)) || exit 1
+fi

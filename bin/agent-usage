@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  echo 'usage: agent usage [--diagnose]' >&2
+}
+
+if [[ $# -ne 0 && ( $# -ne 1 || "$1" != --diagnose ) ]]; then
+  usage
+  exit 2
+fi
+
+cache_seconds="${AGENT_USAGE_CACHE_SECONDS:-900}"
+if [[ ! "$cache_seconds" =~ ^[0-9]+$ ]]; then
+  echo 'agent usage: AGENT_USAGE_CACHE_SECONDS must be a non-negative integer.' >&2
+  exit 2
+fi
+now="${AGENT_USAGE_NOW:-$(date +%s)}"
+if [[ ! "$now" =~ ^[0-9]+$ ]]; then
+  echo 'agent usage: AGENT_USAGE_NOW must be a Unix timestamp.' >&2
+  exit 2
+fi
+
+usage_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+claude_collector="$usage_root/libexec/agent/usage-claude"
+if [[ "${1:-}" == --diagnose ]]; then
+  exec "$claude_collector" "$cache_seconds" "$now" --diagnose
+fi
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+codex_max_files=32
+codex_max_bytes=2097152
+codex_max_lines=512
+codex_recent_minutes=11520
+
+collect_claude_usage() {
+  "$claude_collector" "$cache_seconds" "$now"
+}
+
+codex_snapshot_from_file() {
+  local session_file="$1"
+  local snapshot_now="$2"
+
+  # The byte limit bounds work even when one transcript line contains a very
+  # large tool result. fromjson? ignores both the cut first line and a partial
+  # live final line, leaving any older complete rate snapshot available.
+  tail -c "$codex_max_bytes" -- "$session_file" 2>/dev/null |
+    tail -n "$codex_max_lines" |
+    jq -Rrc --argjson now "$snapshot_now" '
+      fromjson?
+      | select(.type == "event_msg" and .payload.type == "token_count")
+      | .payload.rate_limits
+      | select(type == "object" and .limit_id == "codex")
+      | [.primary?, .secondary?]
+      | map(select(
+          type == "object"
+          and (.used_percent | type == "number" and . >= 0)
+          and (.resets_at | type == "number" and . > $now)
+        ))
+      | if length > 0 then
+          max_by([.used_percent, (-.resets_at)])
+          | {percent: .used_percent, resets_at}
+        else
+          {percent: null, resets_at: null}
+        end
+    ' 2>/dev/null |
+    tail -n 1
+}
+
+collect_codex_usage() {
+  local -a roots=()
+  local record session_file snapshot percent resets_at count=0
+
+  [[ -d "$codex_home/sessions" ]] && roots+=("$codex_home/sessions")
+  [[ -d "$codex_home/archived_sessions" ]] && roots+=("$codex_home/archived_sessions")
+  if [[ ${#roots[@]} -eq 0 ]]; then
+    printf '[]\n'
+    return 0
+  fi
+  while IFS= read -r -d '' record; do
+    count=$((count + 1))
+    (( count <= codex_max_files )) || break
+    session_file="${record#*$'\t'}"
+    snapshot="$(codex_snapshot_from_file "$session_file" "$now")" || snapshot=""
+    if [[ -n "$snapshot" ]]; then
+      percent="$(jq -r '.percent // empty' <<<"$snapshot")"
+      resets_at="$(jq -r '.resets_at // empty' <<<"$snapshot")"
+      if [[ -n "$percent" && -n "$resets_at" ]]; then
+        jq -cn --argjson percent "$percent" --argjson resets_at "$resets_at" \
+          '[{label: "codex", percent: $percent, resets_at: $resets_at}]'
+      else
+        printf '[]\n'
+      fi
+      return 0
+    fi
+  done < <(
+    find "${roots[@]}" -type f -name '*.jsonl' \
+      -mmin "-$codex_recent_minutes" -printf '%T@\t%p\0' 2>/dev/null |
+      sort -z -nr |
+      head -z -n "$codex_max_files"
+  )
+  printf '[]\n'
+}
+
+claude_usage="$(collect_claude_usage)"
+codex_usage="$(collect_codex_usage)"
+combined="$(
+  jq -cn --argjson now "$now" \
+    --argjson claude "$claude_usage" --argjson codex "$codex_usage" '
+    (($claude | map(
+      if .resets_at <= $now then {label, unavailable: true} else . end
+    )) + $codex)
+    | group_by(.label)
+    | map(max_by([(.percent // -1), (-(.resets_at // 0))]))
+    | sort_by(
+        if .label == "claude" then [1, ""]
+        elif .label == "codex" then [2, ""]
+        else [0, .label]
+        end
+      )
+  '
+)"
+
+if [[ "$(jq 'length' <<<"$combined")" -eq 0 ]]; then
+  echo 'agent usage: no session-limit usage is available.' >&2
+  exit 1
+fi
+
+jq -r --argjson now "$now" '
+  def time_left:
+    (.resets_at - $now) as $seconds
+    | if $seconds < 60 then "<1m"
+      else
+        ((($seconds + 59) / 60) | floor) as $minutes
+        | if $minutes >= 1440 then
+            (($minutes / 1440) | floor) as $days
+            | ((($minutes % 1440) / 60) | floor) as $hours
+            | if $hours > 0 then "\($days)d\($hours)h" else "\($days)d" end
+          elif $minutes >= 60 then
+            (($minutes / 60) | floor) as $hours
+            | ($minutes % 60) as $rest
+            | if $rest > 0 then "\($hours)h\($rest)m" else "\($hours)h" end
+          else "\($minutes)m"
+          end
+      end;
+
+  map(if .unavailable then "\(.label): unavailable"
+      else "\(.label): \((.percent + 0.5) | floor)% (\(time_left))" end)
+  | join(" ")
+' <<<"$combined"

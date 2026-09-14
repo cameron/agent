@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Read Claude-owned usage state; let the native client own authentication."""
+
+from datetime import datetime
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def read_json(path, default=None):
+    try:
+        if path.is_symlink():
+            return default
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, value):
+    fd, temporary = tempfile.mkstemp(prefix=".usage-claude.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(value, output, separators=(",", ":"))
+            output.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def normalized(value):
+    return isinstance(value, list) and all(
+        isinstance(item, dict) and isinstance(item.get("label"), str) and item["label"]
+        and number(item.get("percent")) and item["percent"] >= 0
+        and number(item.get("resets_at")) and item["resets_at"] > 0
+        for item in value
+    )
+
+
+def normalize(value, now):
+    if not isinstance(value, dict) or not isinstance(value.get("limits"), list):
+        raise ValueError("invalid-native-usage")
+    readings = {}
+    for limit in value["limits"]:
+        if not isinstance(limit, dict) or not number(limit.get("percent")) or limit["percent"] < 0:
+            continue
+        try:
+            reset = datetime.fromisoformat(limit["resets_at"].replace("Z", "+00:00"))
+            if reset.tzinfo is None:
+                continue
+            reset = reset.timestamp()
+        except (KeyError, ValueError, AttributeError, TypeError):
+            continue
+        if reset <= now:
+            continue
+        scope = limit.get("scope")
+        if limit.get("kind") in ("session", "weekly_all") and scope is None:
+            label = "claude"
+        elif limit.get("kind") == "weekly_scoped" and isinstance(scope, dict):
+            model = scope.get("model")
+            label = model.get("display_name") if isinstance(model, dict) else None
+            if not isinstance(label, str) or not label.strip():
+                continue
+            label = label.lower()
+        else:
+            continue
+        item = {"label": label, "percent": limit["percent"], "resets_at": reset}
+        previous = readings.get(label)
+        if previous is None or (item["percent"], -reset) > (previous["percent"], -previous["resets_at"]):
+            readings[label] = item
+    return list(readings.values())
+
+
+class Collector:
+    def __init__(self, seconds, now):
+        self.seconds = seconds
+        self.now = now
+        self.wall = time.time()
+        self.root = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "agent"
+        self.cache = self.root / "usage-claude.json"
+        self.state_path = self.root / "usage-claude-state.json"
+        # This is Claude Code's public config/cache, not its credentials file.
+        self.config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home()))) / ".claude.json"
+
+    def native_state(self):
+        config = read_json(self.config, {})
+        if not isinstance(config, dict):
+            return None, {}, {}
+        account = config.get("oauthAccount") or {}
+        account_id = account.get("accountUuid") if isinstance(account, dict) else None
+        snapshot = config.get("cachedUsageUtilization") or {}
+        if not isinstance(snapshot, dict) or not account_id or snapshot.get("accountUuid") != account_id:
+            snapshot = {}
+        return account_id, snapshot, config
+
+    def snapshot_readings(self, snapshot, age):
+        fetched = snapshot.get("fetchedAtMs")
+        if not number(fetched) or not -60 <= self.wall - fetched / 1000 <= age:
+            raise ValueError("stale-native-usage")
+        return normalize(snapshot.get("utilization"), self.now)
+
+    def save(self, readings, account_id, snapshot):
+        write_json(self.cache, readings)
+        write_json(self.state_path, {
+            "account": account_id, "observed_at": snapshot["fetchedAtMs"] / 1000,
+            "attempted_at": self.wall, "retry_after": 0, "failures": 0,
+            "last_error": None,
+        })
+        return readings
+
+    def fetch(self):
+        try:
+            result = subprocess.run([
+                os.environ.get("AGENT_CLAUDE_BIN", "claude"),
+                "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                "--settings", '{"disableAllHooks":true}', "--tools", "",
+                "--no-session-persistence", "--max-turns", "0",
+                "-p", "/usage", "--output-format", "json",
+            ], cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, timeout=30,
+                env=dict(os.environ, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"))
+        except FileNotFoundError:
+            raise ValueError("claude-not-found") from None
+        except subprocess.TimeoutExpired:
+            raise ValueError("claude-timeout") from None
+        except OSError:
+            raise ValueError("claude-start-failed") from None
+        try:
+            output = json.loads(result.stdout)
+        except ValueError:
+            raise ValueError("invalid-claude-output") from None
+        if (result.returncode or not isinstance(output, dict) or output.get("is_error") is not False
+                or output.get("num_turns") != 0):
+            raise ValueError("claude-usage-failed")
+
+    def collect_locked(self):
+        state = read_json(self.state_path, {})
+        if not isinstance(state, dict):
+            state = {}
+        stale = read_json(self.cache)
+        valid_cache = normalized(stale)
+        if not valid_cache:
+            stale = []
+        account, snapshot, _ = self.native_state()
+        if state.get("account") and state["account"] != account:
+            # Never carry one account's quota into another login or logout.
+            stale, state = [], {}
+            valid_cache = False
+            write_json(self.cache, [])
+        if self.seconds > 0:
+            try:
+                readings = self.snapshot_readings(snapshot, self.seconds)
+                if snapshot["fetchedAtMs"] / 1000 != state.get("observed_at") or not valid_cache:
+                    return self.save(readings, account, snapshot)
+            except ValueError:
+                pass
+            try:
+                if (valid_cache and self.wall - self.cache.stat().st_mtime <= self.seconds
+                        and all(item["resets_at"] > self.now for item in stale)):
+                    return stale
+            except OSError:
+                pass
+        retry = state.get("retry_after", 0)
+        if number(retry) and retry > self.wall:
+            return stale
+        try:
+            self.fetch()
+            account, snapshot, _ = self.native_state()
+            # /usage can reuse Claude's own five-minute cache. Require a
+            # recent snapshot even when the command returned exit status 0.
+            readings = self.snapshot_readings(snapshot, 300)
+            return self.save(readings, account, snapshot)
+        except ValueError as error:
+            failures = state.get("failures", 0)
+            failures = min(failures, 6) + 1 if isinstance(failures, int) and failures >= 0 else 1
+            delay = min(max(60, self.seconds) * 2 ** (failures - 1), 3600)
+            write_json(self.state_path, {
+                **state, "account": account, "attempted_at": self.wall,
+                "retry_after": self.wall + delay, "failures": failures,
+                "last_error": str(error),
+            })
+            return stale
+
+    def collect(self):
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.root.chmod(0o700)
+        # Every client shares one lock and checks freshness after acquiring it.
+        # Native authentication and usage fetches therefore cannot race.
+        fd = os.open(self.root / "usage-claude.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return self.collect_locked()
+
+    def diagnose(self):
+        state = read_json(self.state_path, {})
+        cache = read_json(self.cache, [])
+        return {"provider": "claude", "source": "claude /usage", "state": state,
+                "cached_labels": [item["label"] for item in cache] if normalized(cache) else [],
+                "cache_path": str(self.cache)}
+
+
+if __name__ == "__main__":
+    collector = Collector(int(sys.argv[1]), int(sys.argv[2]))
+    if sys.argv[3:] == ["--diagnose"]:
+        print(json.dumps(collector.diagnose()))
+    else:
+        try:
+            print(json.dumps(collector.collect()))
+        except OSError:
+            print("[]")
