@@ -1,4 +1,4 @@
-_not intended for direct consumption; provided as reference_
+_not intended for direct consumption; provided as reference; [blog post](https://cameronboehmer.com/p/elements-of-a-metaharness/)_
 
 # agent
 
