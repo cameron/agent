@@ -1,3 +1,5 @@
+_not intended for direct consumption; provided as reference_
+
 # agent
 
 `agent` runs Codex, Claude, or Pi with shared instructions and a common way to
